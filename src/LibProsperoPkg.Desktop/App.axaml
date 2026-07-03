@@ -1,0 +1,184 @@
+<Application xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:fluent="using:Avalonia.Themes.Fluent"
+             x:Class="LibProsperoPkg.Desktop.App"
+             RequestedThemeVariant="Dark">
+  <Application.Styles>
+    <fluent:FluentTheme />
+
+    <Style Selector="Window">
+      <Setter Property="Background" Value="{DynamicResource AppBackgroundBrush}" />
+      <Setter Property="Foreground" Value="{DynamicResource PrimaryTextBrush}" />
+      <Setter Property="FontFamily" Value="Consolas, Fira Code, Roboto Mono, monospace" />
+    </Style>
+
+    <Style Selector="TextBlock">
+      <Setter Property="FontFamily" Value="Consolas, Fira Code, Roboto Mono, monospace" />
+      <Setter Property="Foreground" Value="{DynamicResource PrimaryTextBrush}" />
+    </Style>
+
+    <Style Selector="TextBlock.section-title">
+      <Setter Property="Foreground" Value="{DynamicResource AccentBrush}" />
+      <Setter Property="FontSize" Value="12" />
+      <Setter Property="FontWeight" Value="Bold" />
+      <Setter Property="TextWrapping" Value="NoWrap" />
+      <Setter Property="Opacity" Value="0.92" />
+    </Style>
+
+    <Style Selector="TextBlock.log-line">
+      <Setter Property="Foreground" Value="{DynamicResource LogTextBrush}" />
+      <Setter Property="FontSize" Value="13" />
+      <Setter Property="TextWrapping" Value="NoWrap" />
+    </Style>
+
+    <Style Selector="Border.panel">
+      <Setter Property="Background" Value="{DynamicResource PanelBrush}" />
+      <Setter Property="BorderBrush" Value="{DynamicResource PanelBorderBrush}" />
+      <Setter Property="BorderThickness" Value="1" />
+      <Setter Property="CornerRadius" Value="22" />
+      <Setter Property="Padding" Value="18" />
+      <Setter Property="BoxShadow" Value="0 10 28 0 #00000099" />
+    </Style>
+
+    <Style Selector="Border.shell">
+      <Setter Property="Background" Value="{DynamicResource ShellBrush}" />
+      <Setter Property="BorderBrush" Value="{DynamicResource ShellBorderBrush}" />
+      <Setter Property="BorderThickness" Value="1" />
+      <Setter Property="CornerRadius" Value="30" />
+      <Setter Property="Padding" Value="1" />
+      <Setter Property="Margin" Value="18" />
+      <Setter Property="BoxShadow" Value="0 20 60 0 #000000BB" />
+    </Style>
+
+    <Style Selector="Border.shell.maximized">
+      <Setter Property="Margin" Value="0" />
+      <Setter Property="CornerRadius" Value="0" />
+      <Setter Property="BorderThickness" Value="0" />
+      <Setter Property="BoxShadow" Value="0 0 0 0 #00000000" />
+    </Style>
+
+    <Style Selector="Border.status-pill">
+      <Setter Property="CornerRadius" Value="999" />
+      <Setter Property="Background" Value="{DynamicResource StatusBackgroundBrush}" />
+      <Setter Property="BorderBrush" Value="{DynamicResource AccentBrush}" />
+      <Setter Property="BorderThickness" Value="1" />
+      <Setter Property="Padding" Value="12,6" />
+    </Style>
+
+    <Style Selector="TextBox">
+      <Setter Property="Background" Value="{DynamicResource InputBackgroundBrush}" />
+      <Setter Property="Foreground" Value="{DynamicResource PrimaryTextBrush}" />
+      <Setter Property="BorderBrush" Value="{DynamicResource InputBorderBrush}" />
+      <Setter Property="BorderThickness" Value="1,1,1,2" />
+      <Setter Property="CornerRadius" Value="14" />
+      <Setter Property="Padding" Value="10,8" />
+      <Setter Property="SelectionBrush" Value="{DynamicResource AccentBrush}" />
+      <Setter Property="SelectionForegroundBrush" Value="{DynamicResource AppBackgroundBrush}" />
+      <Setter Property="CaretBrush" Value="{DynamicResource AccentBrush}" />
+      <Setter Property="FontSize" Value="14" />
+    </Style>
+
+    <Style Selector="TextBox:focus">
+      <Setter Property="BorderBrush" Value="{DynamicResource AccentBrush}" />
+      <Setter Property="Background" Value="{DynamicResource InputFocusBackgroundBrush}" />
+    </Style>
+
+    <Style Selector="TextBox:disabled">
+      <Setter Property="Foreground" Value="{DynamicResource MutedTextBrush}" />
+      <Setter Property="Background" Value="{DynamicResource DisabledInputBrush}" />
+      <Setter Property="BorderBrush" Value="{DynamicResource PanelBorderBrush}" />
+    </Style>
+
+    <Style Selector="Button">
+      <Setter Property="Background" Value="{DynamicResource ButtonBackgroundBrush}" />
+      <Setter Property="Foreground" Value="{DynamicResource PrimaryTextBrush}" />
+      <Setter Property="BorderBrush" Value="{DynamicResource ButtonBorderBrush}" />
+      <Setter Property="BorderThickness" Value="1" />
+      <Setter Property="CornerRadius" Value="14" />
+      <Setter Property="Padding" Value="12,9" />
+      <Setter Property="FontSize" Value="14" />
+      <Setter Property="FontFamily" Value="Consolas, Fira Code, Roboto Mono, monospace" />
+    </Style>
+
+    <Style Selector="Button:pointerover">
+      <Setter Property="BorderBrush" Value="{DynamicResource AccentBrush}" />
+      <Setter Property="Background" Value="{DynamicResource ButtonHoverBrush}" />
+    </Style>
+
+    <Style Selector="Button:pressed">
+      <Setter Property="Background" Value="{DynamicResource ButtonPressedBrush}" />
+      <Setter Property="BorderBrush" Value="{DynamicResource AccentBrush}" />
+    </Style>
+
+    <Style Selector="Button.primary-action">
+      <Setter Property="Padding" Value="14,8" />
+      <Setter Property="FontSize" Value="14" />
+      <Setter Property="FontWeight" Value="SemiBold" />
+      <Setter Property="HorizontalAlignment" Value="Center" />
+      <Setter Property="Width" Value="220" />
+      <Setter Property="MinHeight" Value="44" />
+      <Setter Property="BorderBrush" Value="{DynamicResource AccentBrush}" />
+      <Setter Property="Background" Value="{DynamicResource PrimaryActionBrush}" />
+    </Style>
+
+    <Style Selector="Button.primary-action:pointerover">
+      <Setter Property="Background" Value="{DynamicResource PrimaryActionHoverBrush}" />
+    </Style>
+
+    <Style Selector="Button.primary-action.ready">
+      <Setter Property="BorderBrush" Value="{DynamicResource ReadyBorderBrush}" />
+      <Setter Property="Background" Value="{DynamicResource ReadyButtonBrush}" />
+    </Style>
+
+    <Style Selector="Button.primary-action.ready:pointerover">
+      <Setter Property="Background" Value="{DynamicResource ReadyButtonHoverBrush}" />
+    </Style>
+
+    <Style Selector="ScrollViewer.log-scroll">
+      <Setter Property="Background" Value="Transparent" />
+    </Style>
+  </Application.Styles>
+
+  <Application.Resources>
+    <SolidColorBrush x:Key="AppBackgroundBrush" Color="#070910" />
+    <SolidColorBrush x:Key="ShellBrush" Color="#0A0D16" />
+    <SolidColorBrush x:Key="ShellBorderBrush" Color="#1E2440" />
+    <SolidColorBrush x:Key="PanelBrush" Color="#111521" />
+    <SolidColorBrush x:Key="PanelBorderBrush" Color="#28304B" />
+    <SolidColorBrush x:Key="InputBackgroundBrush" Color="#0F1320" />
+    <SolidColorBrush x:Key="InputFocusBackgroundBrush" Color="#111A2B" />
+    <SolidColorBrush x:Key="InputBorderBrush" Color="#2B3350" />
+    <SolidColorBrush x:Key="DisabledInputBrush" Color="#0D1019" />
+    <SolidColorBrush x:Key="ButtonBackgroundBrush" Color="#121827" />
+    <SolidColorBrush x:Key="ButtonBorderBrush" Color="#32415D" />
+    <SolidColorBrush x:Key="ButtonHoverBrush" Color="#172238" />
+    <SolidColorBrush x:Key="ButtonPressedBrush" Color="#0C0F18" />
+    <LinearGradientBrush x:Key="PrimaryActionBrush" StartPoint="0,0" EndPoint="1,1">
+      <GradientStop Color="#0C2035" Offset="0" />
+      <GradientStop Color="#132B4C" Offset="0.5" />
+      <GradientStop Color="#18203A" Offset="1" />
+    </LinearGradientBrush>
+    <LinearGradientBrush x:Key="PrimaryActionHoverBrush" StartPoint="0,0" EndPoint="1,1">
+      <GradientStop Color="#153256" Offset="0" />
+      <GradientStop Color="#1C4F63" Offset="0.55" />
+      <GradientStop Color="#1E2B4E" Offset="1" />
+    </LinearGradientBrush>
+    <LinearGradientBrush x:Key="ReadyButtonBrush" StartPoint="0,0" EndPoint="1,1">
+      <GradientStop Color="#10311E" Offset="0" />
+      <GradientStop Color="#1A5A2F" Offset="0.55" />
+      <GradientStop Color="#0F3B22" Offset="1" />
+    </LinearGradientBrush>
+    <LinearGradientBrush x:Key="ReadyButtonHoverBrush" StartPoint="0,0" EndPoint="1,1">
+      <GradientStop Color="#144021" Offset="0" />
+      <GradientStop Color="#20843E" Offset="0.55" />
+      <GradientStop Color="#12572A" Offset="1" />
+    </LinearGradientBrush>
+    <SolidColorBrush x:Key="AccentBrush" Color="#00E5FF" />
+    <SolidColorBrush x:Key="AccentAltBrush" Color="#FF4FD8" />
+    <SolidColorBrush x:Key="ReadyBorderBrush" Color="#4CFF7A" />
+    <SolidColorBrush x:Key="PrimaryTextBrush" Color="#E7EEFF" />
+    <SolidColorBrush x:Key="MutedTextBrush" Color="#A8B3CC" />
+    <SolidColorBrush x:Key="LogTextBrush" Color="#7DFFB5" />
+    <SolidColorBrush x:Key="StatusBackgroundBrush" Color="#111824" />
+  </Application.Resources>
+</Application>

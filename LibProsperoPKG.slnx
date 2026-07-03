@@ -1,0 +1,6 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/LibProsperoPkg.Desktop/LibProsperoPkg.Desktop.csproj" />
+    <Project Path="src/LibProsperoPkg/LibProsperoPkg.csproj" />
+  </Folder>
+</Solution>

@@ -1,0 +1,132 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:vm="clr-namespace:LibProsperoPkg.Desktop.ViewModels"
+        x:Class="LibProsperoPkg.Desktop.Views.MainWindow"
+        x:DataType="vm:MainWindowViewModel"
+        Width="1200"
+        Height="860"
+        MinWidth="980"
+        MinHeight="760"
+        Title="LibProsperoPKG"
+        Icon="avares://LibProsperoPkg.Desktop/Assets/icone.png"
+        Background="{DynamicResource AppBackgroundBrush}">
+  <Grid RowDefinitions="*">
+    <ScrollViewer VerticalScrollBarVisibility="Auto"
+                  HorizontalScrollBarVisibility="Disabled">
+      <Border x:Name="ShellBorder"
+              Classes="shell">
+        <Grid Margin="20" RowDefinitions="Auto,18,Auto,18,*">
+          <Border Classes="panel" Grid.Row="0">
+            <StackPanel Spacing="14">
+              <Grid ColumnDefinitions="*,Auto" VerticalAlignment="Center">
+                <StackPanel Spacing="4">
+                  <TextBlock Classes="section-title" Text="HEADER AND METADATA" />
+                </StackPanel>
+
+                <Border Grid.Column="1"
+                        Classes="status-pill"
+                        VerticalAlignment="Center">
+                  <TextBlock FontSize="12"
+                             Text="{Binding BuildStatusMessage}" />
+                </Border>
+              </Grid>
+
+              <Grid ColumnDefinitions="2*,1.15*,2.25*,1.15*" ColumnSpacing="12">
+                <StackPanel Grid.Column="0" Spacing="6">
+                  <TextBlock Classes="section-title" Text="TITLE" />
+                  <TextBox Text="{Binding Title, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
+                           PlaceholderText="Application title" />
+                </StackPanel>
+
+                <StackPanel Grid.Column="1" Spacing="6">
+                  <TextBlock Classes="section-title" Text="TITLE ID" />
+                  <TextBox Text="{Binding TitleId, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
+                           PlaceholderText="PPSA00000" />
+                </StackPanel>
+
+                <StackPanel Grid.Column="2" Spacing="6">
+                  <TextBlock Classes="section-title" Text="CONTENT ID" />
+                  <TextBox Text="{Binding ContentId, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
+                           PlaceholderText="UP9000-PPSA00000_00-PROSPERO00000000" />
+                </StackPanel>
+
+                <StackPanel Grid.Column="3" Spacing="6">
+                  <TextBlock Classes="section-title" Text="VERSION" />
+                  <TextBox Text="{Binding Version, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
+                           PlaceholderText="01.00" />
+                </StackPanel>
+              </Grid>
+            </StackPanel>
+          </Border>
+
+          <Border Classes="panel" Grid.Row="2">
+            <Grid RowDefinitions="Auto,12,Auto,12,*">
+              <TextBlock Classes="section-title" Text="DIRECTORIES AND ACTIONS" />
+
+              <StackPanel Grid.Row="2" Spacing="12">
+                <Grid ColumnDefinitions="*,Auto" ColumnSpacing="10">
+                  <TextBox Grid.Column="0"
+                           Text="{Binding SourceFolder}"
+                           IsReadOnly="True"
+                           PlaceholderText="Select the source sce_sys folder" />
+                  <Button Grid.Column="1"
+                          Content="Browse"
+                          Command="{Binding BrowseSourceCommand}" />
+                </Grid>
+
+                <Grid ColumnDefinitions="*,Auto" ColumnSpacing="10">
+                  <TextBox Grid.Column="0"
+                           Text="{Binding OutputFolder}"
+                           IsReadOnly="True"
+                           PlaceholderText="Select the destination folder" />
+                  <Button Grid.Column="1"
+                          Content="Browse"
+                          Command="{Binding BrowseOutputCommand}" />
+                </Grid>
+              </StackPanel>
+
+              <Button Classes="primary-action"
+                      Classes.ready="{Binding IsReadyToBuild}"
+                      Grid.Row="4"
+                      Command="{Binding CompilePkgCommand}"
+                      HorizontalAlignment="Center"
+                      VerticalAlignment="Center">
+                <TextBlock Text="Build PKG"
+                           HorizontalAlignment="Center"
+                           VerticalAlignment="Center"
+                           Foreground="{DynamicResource PrimaryTextBrush}" />
+              </Button>
+            </Grid>
+          </Border>
+
+          <Border Classes="panel" Grid.Row="4">
+            <Grid RowDefinitions="Auto,*" RowSpacing="14">
+              <TextBlock Classes="section-title" Text="BUILD LOG" />
+
+              <Border Grid.Row="1"
+                      Background="#050507"
+                      BorderBrush="{DynamicResource PanelBorderBrush}"
+                      BorderThickness="1"
+                      CornerRadius="16"
+                      Padding="12"
+                      BoxShadow="0 0 24 0 #00E5FF22">
+                <ScrollViewer x:Name="LogScrollViewer"
+                              Classes="log-scroll"
+                              HorizontalScrollBarVisibility="Auto"
+                              VerticalScrollBarVisibility="Auto">
+                  <ItemsControl ItemsSource="{Binding LogEntries}">
+                    <ItemsControl.ItemTemplate>
+                      <DataTemplate x:DataType="x:String">
+                        <TextBlock Classes="log-line" Text="{Binding}" />
+                      </DataTemplate>
+                    </ItemsControl.ItemTemplate>
+                  </ItemsControl>
+                </ScrollViewer>
+              </Border>
+            </Grid>
+          </Border>
+        </Grid>
+      </Border>
+    </ScrollViewer>
+  </Grid>
+</Window>
