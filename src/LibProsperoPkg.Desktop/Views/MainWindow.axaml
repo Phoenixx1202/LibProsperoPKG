@@ -3,130 +3,371 @@
         xmlns:vm="clr-namespace:LibProsperoPkg.Desktop.ViewModels"
         x:Class="LibProsperoPkg.Desktop.Views.MainWindow"
         x:DataType="vm:MainWindowViewModel"
-        Width="1200"
-        Height="860"
-        MinWidth="980"
-        MinHeight="760"
+        Width="1320"
+        Height="920"
+        MinWidth="1100"
+        MinHeight="780"
         Title="LibProsperoPKG"
         Icon="avares://LibProsperoPkg.Desktop/Assets/icone.png"
         Background="{DynamicResource AppBackgroundBrush}">
   <Grid RowDefinitions="*">
-    <ScrollViewer VerticalScrollBarVisibility="Auto"
-                  HorizontalScrollBarVisibility="Disabled">
-      <Border x:Name="ShellBorder"
-              Classes="shell">
-        <Grid Margin="20" RowDefinitions="Auto,18,Auto,18,*">
-          <Border Classes="panel" Grid.Row="0">
-            <StackPanel Spacing="14">
-              <Grid ColumnDefinitions="*,Auto" VerticalAlignment="Center">
-                <StackPanel Spacing="4">
-                  <TextBlock Classes="section-title" Text="HEADER AND METADATA" />
-                </StackPanel>
+    <Border x:Name="ShellBorder"
+            Classes="shell">
+      <Grid Margin="20"
+            RowDefinitions="*,260"
+            RowSpacing="16">
+        <TabControl Grid.Row="0">
+          <TabItem Header="Build PKG">
+            <ScrollViewer VerticalScrollBarVisibility="Auto"
+                          HorizontalScrollBarVisibility="Disabled">
+              <Grid RowDefinitions="Auto,18,Auto,18,Auto"
+                    RowSpacing="0">
+                <Border Classes="panel">
+                  <StackPanel Spacing="14">
+                    <Grid ColumnDefinitions="*,Auto" VerticalAlignment="Center">
+                      <TextBlock Classes="section-title"
+                                 Text="BUILD METADATA" />
+                      <Border Grid.Column="1"
+                              Classes="status-pill"
+                              VerticalAlignment="Center">
+                        <TextBlock FontSize="12"
+                                   Text="{Binding BuildStatusMessage}" />
+                      </Border>
+                    </Grid>
 
-                <Border Grid.Column="1"
-                        Classes="status-pill"
-                        VerticalAlignment="Center">
-                  <TextBlock FontSize="12"
-                             Text="{Binding BuildStatusMessage}" />
+                    <Grid ColumnDefinitions="2*,1.15*,2.25*,1.15*"
+                          ColumnSpacing="12">
+                      <StackPanel Grid.Column="0" Spacing="6">
+                        <TextBlock Classes="section-title" Text="TITLE" />
+                        <TextBox Text="{Binding Title, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
+                                 PlaceholderText="Application title" />
+                      </StackPanel>
+
+                      <StackPanel Grid.Column="1" Spacing="6">
+                        <TextBlock Classes="section-title" Text="TITLE ID" />
+                        <TextBox Text="{Binding TitleId, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
+                                 PlaceholderText="PPSA00000" />
+                      </StackPanel>
+
+                      <StackPanel Grid.Column="2" Spacing="6">
+                        <TextBlock Classes="section-title" Text="CONTENT ID" />
+                        <TextBox Text="{Binding ContentId, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
+                                 PlaceholderText="UP9000-PPSA00000_00-PROSPERO00000000" />
+                      </StackPanel>
+
+                      <StackPanel Grid.Column="3" Spacing="6">
+                        <TextBlock Classes="section-title" Text="VERSION" />
+                        <TextBox Text="{Binding Version, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
+                                 PlaceholderText="01.00" />
+                      </StackPanel>
+                    </Grid>
+                  </StackPanel>
+                </Border>
+
+                <Border Grid.Row="2"
+                        Classes="panel">
+                  <Grid RowDefinitions="Auto,12,Auto,12,*">
+                    <TextBlock Classes="section-title"
+                               Text="DIRECTORIES AND ACTIONS" />
+
+                    <StackPanel Grid.Row="2" Spacing="12">
+                      <Grid ColumnDefinitions="*,Auto" ColumnSpacing="10">
+                        <TextBox Grid.Column="0"
+                                 Text="{Binding SourceFolder}"
+                                 IsReadOnly="True"
+                                 PlaceholderText="Select the source sce_sys folder" />
+                        <Button Grid.Column="1"
+                                Content="Browse"
+                                Command="{Binding BrowseSourceCommand}" />
+                      </Grid>
+
+                      <Grid ColumnDefinitions="*,Auto" ColumnSpacing="10">
+                        <TextBox Grid.Column="0"
+                                 Text="{Binding OutputFolder}"
+                                 IsReadOnly="True"
+                                 PlaceholderText="Select the destination folder" />
+                        <Button Grid.Column="1"
+                                Content="Browse"
+                                Command="{Binding BrowseOutputCommand}" />
+                      </Grid>
+                    </StackPanel>
+
+                    <Button Grid.Row="4"
+                            Classes="primary-action"
+                            Classes.ready="{Binding IsReadyToBuild}"
+                            Command="{Binding CompilePkgCommand}"
+                            HorizontalAlignment="Center"
+                            VerticalAlignment="Center"
+                            Width="180"
+                            Content="Build PKG" />
+                  </Grid>
                 </Border>
               </Grid>
+            </ScrollViewer>
+          </TabItem>
 
-              <Grid ColumnDefinitions="2*,1.15*,2.25*,1.15*" ColumnSpacing="12">
-                <StackPanel Grid.Column="0" Spacing="6">
-                  <TextBlock Classes="section-title" Text="TITLE" />
-                  <TextBox Text="{Binding Title, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
-                           PlaceholderText="Application title" />
-                </StackPanel>
+          <TabItem Header="Read PKG">
+            <ScrollViewer VerticalScrollBarVisibility="Auto"
+                          HorizontalScrollBarVisibility="Disabled">
+              <Grid RowDefinitions="Auto,18,Auto,18,Auto,18,Auto,18,*"
+                    RowSpacing="0">
+                <Border Classes="panel">
+                  <StackPanel Spacing="14">
+                    <Grid ColumnDefinitions="*,Auto" VerticalAlignment="Center">
+                      <TextBlock Classes="section-title"
+                                 Text="PACKAGE INSPECTION" />
+                      <Border Grid.Column="1"
+                              Classes="status-pill"
+                              VerticalAlignment="Center">
+                        <TextBlock FontSize="12"
+                                   Text="{Binding PackageStatusMessage}" />
+                      </Border>
+                    </Grid>
 
-                <StackPanel Grid.Column="1" Spacing="6">
-                  <TextBlock Classes="section-title" Text="TITLE ID" />
-                  <TextBox Text="{Binding TitleId, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
-                           PlaceholderText="PPSA00000" />
-                </StackPanel>
+                    <Grid ColumnDefinitions="*,Auto,Auto"
+                          ColumnSpacing="10">
+                      <TextBox Grid.Column="0"
+                               Text="{Binding PackageFilePath, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
+                               PlaceholderText="Select a PKG file" />
+                      <Button Grid.Column="1"
+                              Content="Open PKG"
+                              Command="{Binding BrowsePackageCommand}" />
+                      <Button Grid.Column="2"
+                              Content="Reload"
+                              Command="{Binding LoadPackageCommand}" />
+                    </Grid>
+                  </StackPanel>
+                </Border>
 
-                <StackPanel Grid.Column="2" Spacing="6">
-                  <TextBlock Classes="section-title" Text="CONTENT ID" />
-                  <TextBox Text="{Binding ContentId, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
-                           PlaceholderText="UP9000-PPSA00000_00-PROSPERO00000000" />
-                </StackPanel>
+                <Border Grid.Row="2"
+                        Classes="panel">
+                  <StackPanel Spacing="14">
+                    <TextBlock Classes="section-title"
+                               Text="EXTRACTION AND REBUILD" />
 
-                <StackPanel Grid.Column="3" Spacing="6">
-                  <TextBlock Classes="section-title" Text="VERSION" />
-                  <TextBox Text="{Binding Version, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
-                           PlaceholderText="01.00" />
-                </StackPanel>
+                    <Grid RowDefinitions="Auto,10,Auto"
+                          RowSpacing="0">
+                      <Grid ColumnDefinitions="*,Auto,Auto"
+                            ColumnSpacing="10">
+                        <TextBox Grid.Column="0"
+                                 Text="{Binding PackageExtractFolder, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
+                                 PlaceholderText="Extraction folder" />
+                        <Button Grid.Column="1"
+                                Content="Browse"
+                                Command="{Binding BrowsePackageExtractFolderCommand}" />
+                        <Button Grid.Column="2"
+                                Content="Extract Found Files"
+                                Command="{Binding ExtractPackageCommand}" />
+                      </Grid>
+
+                      <Grid Grid.Row="2"
+                            ColumnDefinitions="*,Auto,Auto"
+                            ColumnSpacing="10">
+                        <TextBox Grid.Column="0"
+                                 Text="{Binding PackageRecompileOutputFolder, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
+                                 PlaceholderText="Recompile output folder" />
+                        <Button Grid.Column="1"
+                                Content="Browse"
+                                Command="{Binding BrowsePackageRecompileOutputFolderCommand}" />
+                        <Button Grid.Column="2"
+                                Content="Recompile"
+                                Command="{Binding RecompilePackageCommand}" />
+                      </Grid>
+                    </Grid>
+                  </StackPanel>
+                </Border>
+
+                <Grid Grid.Row="4"
+                      ColumnDefinitions="1.05*,1.25*"
+                      ColumnSpacing="16">
+                  <Border Classes="panel">
+                    <Grid RowDefinitions="Auto,12,Auto">
+                      <TextBlock Classes="section-title"
+                                 Text="PACKAGE PREVIEW" />
+
+                      <Grid Grid.Row="2"
+                            RowDefinitions="Auto,16,Auto"
+                            RowSpacing="0">
+                        <Border Classes="preview-card">
+                          <StackPanel Spacing="8">
+                            <TextBlock Classes="section-title"
+                                       Text="ICON" />
+                            <Image Source="{Binding PackageIcon}"
+                                   Height="220"
+                                   Stretch="Uniform"
+                                   HorizontalAlignment="Center"
+                                   VerticalAlignment="Center" />
+                          </StackPanel>
+                        </Border>
+
+                        <Border Grid.Row="2"
+                                Classes="preview-card">
+                          <StackPanel Spacing="8">
+                            <TextBlock Classes="section-title"
+                                       Text="BACKGROUND" />
+                            <Image Source="{Binding PackageBackground}"
+                                   Height="220"
+                                   Stretch="UniformToFill"
+                                   HorizontalAlignment="Stretch"
+                                   VerticalAlignment="Stretch" />
+                          </StackPanel>
+                        </Border>
+                      </Grid>
+                    </Grid>
+                  </Border>
+
+                  <Border Grid.Column="1"
+                          Classes="panel">
+                    <Grid RowDefinitions="Auto,12,*">
+                      <TextBlock Classes="section-title"
+                                 Text="PACKAGE DETAILS" />
+
+                      <Grid Grid.Row="2"
+                            ColumnDefinitions="*,*"
+                            ColumnSpacing="14"
+                            RowSpacing="10">
+                        <StackPanel Grid.Column="0" Spacing="10">
+                          <StackPanel>
+                            <TextBlock Classes="meta-label" Text="TYPE" />
+                            <TextBlock Classes="meta-value" Text="{Binding PackageTypeLabel}" />
+                          </StackPanel>
+                          <StackPanel>
+                            <TextBlock Classes="meta-label" Text="TITLE" />
+                            <TextBlock Classes="meta-value" Text="{Binding PackageTitle}" />
+                          </StackPanel>
+                          <StackPanel>
+                            <TextBlock Classes="meta-label" Text="TITLE ID" />
+                            <TextBlock Classes="meta-value" Text="{Binding PackageTitleId}" />
+                          </StackPanel>
+                          <StackPanel>
+                            <TextBlock Classes="meta-label" Text="CONTENT ID" />
+                            <TextBlock Classes="meta-value" Text="{Binding PackageContentId}" />
+                          </StackPanel>
+                          <StackPanel>
+                            <TextBlock Classes="meta-label" Text="VERSION" />
+                            <TextBlock Classes="meta-value" Text="{Binding PackageVersion}" />
+                          </StackPanel>
+                          <StackPanel>
+                            <TextBlock Classes="meta-label" Text="CONTENT VERSION" />
+                            <TextBlock Classes="meta-value" Text="{Binding PackageContentVersion}" />
+                          </StackPanel>
+                        </StackPanel>
+
+                        <StackPanel Grid.Column="1" Spacing="10">
+                          <StackPanel>
+                            <TextBlock Classes="meta-label" Text="MASTER VERSION" />
+                            <TextBlock Classes="meta-value" Text="{Binding PackageMasterVersion}" />
+                          </StackPanel>
+                          <StackPanel>
+                            <TextBlock Classes="meta-label" Text="DRM TYPE" />
+                            <TextBlock Classes="meta-value" Text="{Binding PackageDrmType}" />
+                          </StackPanel>
+                          <StackPanel>
+                            <TextBlock Classes="meta-label" Text="CONTENT TYPE" />
+                            <TextBlock Classes="meta-value" Text="{Binding PackageContentType}" />
+                          </StackPanel>
+                          <StackPanel>
+                            <TextBlock Classes="meta-label" Text="SIGNED BYTE" />
+                            <TextBlock Classes="meta-value" Text="{Binding PackageSignedByte}" />
+                          </StackPanel>
+                          <StackPanel>
+                            <TextBlock Classes="meta-label" Text="BODY OFFSET" />
+                            <TextBlock Classes="meta-value" Text="{Binding PackageBodyOffset}" />
+                          </StackPanel>
+                          <StackPanel>
+                            <TextBlock Classes="meta-label" Text="BODY SIZE" />
+                            <TextBlock Classes="meta-value" Text="{Binding PackageBodySize}" />
+                          </StackPanel>
+                          <StackPanel>
+                            <TextBlock Classes="meta-label" Text="PACKAGE SIZE" />
+                            <TextBlock Classes="meta-value" Text="{Binding PackageSize}" />
+                          </StackPanel>
+                          <StackPanel>
+                            <TextBlock Classes="meta-label" Text="ENTRIES" />
+                            <TextBlock Classes="meta-value" Text="{Binding PackageEntryCount}" />
+                          </StackPanel>
+                        </StackPanel>
+                      </Grid>
+                    </Grid>
+                  </Border>
+                </Grid>
+
+                <Border Grid.Row="8"
+                        Classes="panel">
+                  <Grid RowDefinitions="Auto,12,*">
+                    <TextBlock Classes="section-title"
+                               Text="PACKAGE VIEW" />
+
+                    <Border Grid.Row="2"
+                            Background="#05070B"
+                            BorderBrush="{DynamicResource PanelBorderBrush}"
+                            BorderThickness="1"
+                            CornerRadius="18"
+                            Padding="12">
+                      <TreeView ItemsSource="{Binding PackageTree}">
+                        <TreeView.ItemTemplate>
+                          <TreeDataTemplate ItemsSource="{Binding Children}">
+                            <Grid ColumnDefinitions="*,120,120,140"
+                                  ColumnSpacing="12"
+                                  Margin="0,3">
+                              <TextBlock Text="{Binding Name}"
+                                         TextTrimming="CharacterEllipsis" />
+                              <TextBlock Grid.Column="1"
+                                         Text="{Binding KindText}"
+                                         Foreground="{DynamicResource AccentBrush}" />
+                              <TextBlock Grid.Column="2"
+                                         Text="{Binding SizeText}"
+                                         HorizontalAlignment="Right" />
+                              <TextBlock Grid.Column="3"
+                                         Text="{Binding FlagsText}"
+                                         HorizontalAlignment="Right"
+                                         Foreground="{DynamicResource MutedTextBrush}" />
+                            </Grid>
+                          </TreeDataTemplate>
+                        </TreeView.ItemTemplate>
+                      </TreeView>
+                    </Border>
+                  </Grid>
+                </Border>
               </Grid>
-            </StackPanel>
-          </Border>
+            </ScrollViewer>
+          </TabItem>
+        </TabControl>
 
-          <Border Classes="panel" Grid.Row="2">
-            <Grid RowDefinitions="Auto,12,Auto,12,*">
-              <TextBlock Classes="section-title" Text="DIRECTORIES AND ACTIONS" />
-
-              <StackPanel Grid.Row="2" Spacing="12">
-                <Grid ColumnDefinitions="*,Auto" ColumnSpacing="10">
-                  <TextBox Grid.Column="0"
-                           Text="{Binding SourceFolder}"
-                           IsReadOnly="True"
-                           PlaceholderText="Select the source sce_sys folder" />
-                  <Button Grid.Column="1"
-                          Content="Browse"
-                          Command="{Binding BrowseSourceCommand}" />
-                </Grid>
-
-                <Grid ColumnDefinitions="*,Auto" ColumnSpacing="10">
-                  <TextBox Grid.Column="0"
-                           Text="{Binding OutputFolder}"
-                           IsReadOnly="True"
-                           PlaceholderText="Select the destination folder" />
-                  <Button Grid.Column="1"
-                          Content="Browse"
-                          Command="{Binding BrowseOutputCommand}" />
-                </Grid>
-              </StackPanel>
-
-              <Button Classes="primary-action"
-                      Classes.ready="{Binding IsReadyToBuild}"
-                      Grid.Row="4"
-                      Command="{Binding CompilePkgCommand}"
-                      HorizontalAlignment="Center"
-                      VerticalAlignment="Center">
-                <TextBlock Text="Build PKG"
-                           HorizontalAlignment="Center"
-                           VerticalAlignment="Center"
-                           Foreground="{DynamicResource PrimaryTextBrush}" />
-              </Button>
+        <Border Grid.Row="1"
+                Classes="panel">
+          <Grid RowDefinitions="Auto,12,*">
+            <Grid ColumnDefinitions="*,Auto" VerticalAlignment="Center">
+              <TextBlock Classes="section-title"
+                         Text="BUILD LOG" />
+              <TextBlock Grid.Column="1"
+                         Classes="meta-label"
+                         Text="{Binding LogEntries.Count}" />
             </Grid>
-          </Border>
 
-          <Border Classes="panel" Grid.Row="4">
-            <Grid RowDefinitions="Auto,*" RowSpacing="14">
-              <TextBlock Classes="section-title" Text="BUILD LOG" />
-
-              <Border Grid.Row="1"
-                      Background="#050507"
-                      BorderBrush="{DynamicResource PanelBorderBrush}"
-                      BorderThickness="1"
-                      CornerRadius="16"
-                      Padding="12"
-                      BoxShadow="0 0 24 0 #00E5FF22">
-                <ScrollViewer x:Name="LogScrollViewer"
-                              Classes="log-scroll"
-                              HorizontalScrollBarVisibility="Auto"
-                              VerticalScrollBarVisibility="Auto">
-                  <ItemsControl ItemsSource="{Binding LogEntries}">
-                    <ItemsControl.ItemTemplate>
-                      <DataTemplate x:DataType="x:String">
-                        <TextBlock Classes="log-line" Text="{Binding}" />
-                      </DataTemplate>
-                    </ItemsControl.ItemTemplate>
-                  </ItemsControl>
-                </ScrollViewer>
-              </Border>
-            </Grid>
-          </Border>
-        </Grid>
-      </Border>
-    </ScrollViewer>
+            <Border Grid.Row="2"
+                    Background="#050507"
+                    BorderBrush="{DynamicResource PanelBorderBrush}"
+                    BorderThickness="1"
+                    CornerRadius="16"
+                    Padding="12"
+                    BoxShadow="0 0 24 0 #00E5FF22">
+              <ScrollViewer x:Name="LogScrollViewer"
+                            Classes="log-scroll"
+                            HorizontalScrollBarVisibility="Auto"
+                            VerticalScrollBarVisibility="Auto">
+                <ItemsControl ItemsSource="{Binding LogEntries}">
+                  <ItemsControl.ItemTemplate>
+                    <DataTemplate x:DataType="x:String">
+                      <TextBlock Classes="log-line" Text="{Binding}" />
+                    </DataTemplate>
+                  </ItemsControl.ItemTemplate>
+                </ItemsControl>
+              </ScrollViewer>
+            </Border>
+          </Grid>
+        </Border>
+      </Grid>
+    </Border>
   </Grid>
 </Window>

@@ -19,7 +19,7 @@ public partial class MainWindow : Window
         InitializeComponent();
         viewModel = new MainWindowViewModel
         {
-            FolderDialogService = new AvaloniaFolderDialogService(StorageProvider),
+            PathDialogService = new AvaloniaFolderDialogService(StorageProvider),
         };
         DataContext = viewModel;
 
@@ -77,9 +77,10 @@ public partial class MainWindow : Window
                     return;
                 }
 
+                double targetY = Math.Max(0, LogScrollViewer.Extent.Height - LogScrollViewer.Viewport.Height);
                 LogScrollViewer.Offset = new Avalonia.Vector(
                     LogScrollViewer.Offset.X,
-                    double.MaxValue);
+                    targetY);
             }
             catch
             {
