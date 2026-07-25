@@ -78,7 +78,7 @@ public sealed class FselfOptions
     public ulong FirmwareVersion { get; init; }
 
     /// <summary>
-    /// Overrides the authority id. When null, the id is derived from the ELF type and the ex-info byte.
+    /// Overrides the authority id. When null, the fake-authority id is written.
     /// </summary>
     public ulong? AuthorityId { get; init; }
 
@@ -98,7 +98,7 @@ public sealed class FselfOptions
 /// <remarks>
 /// Layout (little-endian scalars):
 /// <list type="bullet">
-/// <item>Container header, 0x20 bytes: magic <c>0x1D3D154F</c>, version/mode/endian/attr bytes, program type,
+/// <item>Container header, 0x20 bytes: magic <c>0xEEF51454</c>, version/mode/endian/attr bytes, program type,
 /// header size, metadata size, file size, segment count, flags.</item>
 /// <item>Segment table at 0x20, one 0x20-byte entry per segment: flags, file offset, file size, memory
 /// size. Content segments come in pairs (a zero-filled digest segment then the data segment).</item>
@@ -111,7 +111,7 @@ public sealed class FselfOptions
 public static class ProsperoFself
 {
     /// <summary>Container header magic at file offset 0x00.</summary>
-    public const uint Magic = 0x1D3D154F;
+    public const uint Magic = 0xEEF51454;
 
     private const int ContainerHeaderSize = 0x20;
     private const int SegEntrySize = 0x20;
@@ -122,17 +122,14 @@ public static class ProsperoFself
     private const int FooterMarkerOffset = 0x3F0;
     private const uint DefaultProgramType = 0x00000101;
 
-    // Fake-authority ids selected by the ex-info byte at ELF offset 0x3f00, split by executable type.
-    private const ulong PaidExec = 0x3100000000000001;
-    private const ulong PaidDynamic = 0x3100000000000002;
-    private const ulong PaidExecA = 0x3100000000001101;
-    private const ulong PaidDynamicA = 0x3100000000001102;
-    private const ulong PaidExecB = 0x3100000000001001;
-    private const ulong PaidDynamicB = 0x3100000000001002;
+    /// <summary>
+    /// Program authority id (PAID) a fake-self carries. One value covers an executable and a library
+    /// alike; it does not vary with the module type.
+    /// </summary>
+    public const ulong FakeAuthorityId = 0x3100000000000002;
 
     private const int ElfHeaderSize = 0x40;
     private const int ElfPhdrSize = 0x38;
-    private const int ExInfoByteOffset = 0x3F00;
 
     /// <summary>Returns whether the buffer begins with a SELF container header.</summary>
     public static bool IsSelf(ReadOnlySpan<byte> data) =>
@@ -253,7 +250,9 @@ public static class ProsperoFself
         int elfHdrLen = ElfHeaderSize + phnum * ElfPhdrSize;
         int extInfoStart = AlignUp(afterSeg + elfHdrLen, 0x10);
         int headerSize = extInfoStart + ExtInfoSize + ControlRegionSize;
-        int metaSize = MetaFooterBase + (segCount + 4) * 0x40;
+        // One 0x40-byte block per segment plus the fixed group that closes the footer out. Both this and
+        // the header size are matched against containers a console accepts.
+        int metaSize = MetaFooterBase + (segCount + 8) * 0x40;
         int dataStart = headerSize + metaSize;
 
         // The container header stores headerSize and metaSize as u16 fields (0x0C / 0x0E). A module
@@ -307,7 +306,7 @@ public static class ProsperoFself
 
         elf.AsSpan(0, elfHdrLen).CopyTo(span[afterSeg..]);
 
-        ulong authorityId = options.AuthorityId ?? DeriveAuthorityId(elf, eType);
+        ulong authorityId = options.AuthorityId ?? FakeAuthorityId;
         BinaryPrimitives.WriteUInt64LittleEndian(span[extInfoStart..], authorityId);
         BinaryPrimitives.WriteUInt64LittleEndian(span[(extInfoStart + 0x08)..], 1); // program type
         BinaryPrimitives.WriteUInt64LittleEndian(span[(extInfoStart + 0x10)..], options.AppVersion);
@@ -349,18 +348,6 @@ public static class ProsperoFself
                 result.Add(new SelectedSegment(i, (int)off, (int)fsz));
         }
         return result;
-    }
-
-    private static ulong DeriveAuthorityId(byte[] elf, ushort eType)
-    {
-        bool exec = eType == 0x02 || eType == 0xFE00 || eType == 0xFE10;
-        byte ex = ExInfoByteOffset < elf.Length ? elf[ExInfoByteOffset] : (byte)0;
-        return ex switch
-        {
-            0x40 => exec ? PaidExecA : PaidDynamicA,
-            0x80 => exec ? PaidExecB : PaidDynamicB,
-            _ => exec ? PaidExec : PaidDynamic,
-        };
     }
 
     private static void WriteSegment(Span<byte> span, int entry, ulong flags, ulong offset, ulong fileSize, ulong memSize)

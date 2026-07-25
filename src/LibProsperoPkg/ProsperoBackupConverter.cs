@@ -129,7 +129,7 @@ public sealed class ProsperoBackupConversionResult
 public static class ProsperoBackupConverter
 {
     private const uint ElfMagic = 0x464C457FU;   // 0x7F 'E' 'L' 'F'
-    private const uint SelfMagic = 0x1D3D154FU;  // SELF container magic on disk (fake and genuine alike)
+    private const uint SelfMagic = 0xEEF51454U;  // SELF container magic on disk (fake and genuine alike)
     private const ulong AuthorityMask = 0xFF00000000000000UL;
     private const ulong FakeAuthorityPrefix = 0x3100000000000000UL;
 
