@@ -268,6 +268,15 @@ public sealed class ProsperoPs5InnerImageAssembler
         // ProsperoPs5InnerImageBuilder.Build exactly.
         long dataBlocks = ComputeDataRegionBlocks(afidOrder);
 
+        // Pad dataBlocks up so that `metaBase = (dataBlocks + 63) * BlockSize` and the inner sblock at
+        // `(dataBlocks + 61) * BlockSize` land on U-block boundaries (= 4 * BlockSize = 0x40000). This is
+        // the invariant (dataBlocks=75 → (75+61)%4 == 0) that lets the kernel's
+        // u2c mapping-entry point DIRECTLY at the metadata Kraken cblock in
+        // `read_naps_pfs_image_start` @ k1001+0x5c3f10 without a mid-U-block straddle. Padding is
+        // purely logical (no physical bytes) — the naps padding cblock chain covers the gap.
+        while ((dataBlocks + 61) % 4 != 0)
+            dataBlocks++;
+
         // ---- 4. Dirents (with byte offsets). -------------------------------------------------------
         BuildDirents(uroot);
 

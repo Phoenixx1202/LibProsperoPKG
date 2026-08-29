@@ -806,10 +806,10 @@ public static class ProsperoPkgBuilder
         writer.WriteBody(pkg, props.ContentId, props.Passcode);
         CalcBodyDigests(pkg, s);
 
-        // CNT+0x520 descriptor digest (best-effort): a SHA3-256 digest over each of the two CNT regions the 0x510 descriptor
-        // locates (the IMAGE_KEY entry and the mandatory/imagedigs entry), read as on-disk bytes now that the
-        // body is written. The exact console algorithm hashes decrypted build-time data and is not reproduced
-        // off-console; the 0x80b21185 geometry gate does not read this digest.
+        // CNT+0x520/+0x540 descriptor digests: SHA3-256 over each of the two CNT regions the 0x510 descriptor
+        // pair locates (the IMAGE_KEY entry and the mandatory/imagedigs entry), read as on-disk bytes now that
+        // the body is written. This relationship holds exactly for reference packages, so the values are
+        // reproduced rather than approximated.
         pkg.Header.desc_digest = ComputeDescriptorDigest(s, pkg.Header);
 
         // Header, header digest and the header signature.
@@ -943,19 +943,34 @@ public static class ProsperoPkgBuilder
 
     /// <summary>
     /// FIH 0x9C value: the high 32 bits of the param/content_ver u64 stored in the FIH header.
-    /// <paramref name="contentVersion"/> is the param.json "MM.mmm.ppp" string (e.g. "01.000.000"); the major
-    /// field is BCD-encoded into the top byte, giving 0x01000000 for content version 01.00.
+    /// <paramref name="contentVersion"/> is the param.json "MM.mmm.ppp" string (e.g. "01.001.000"). All three
+    /// fields are BCD-encoded and packed 2-3-3 hex digits: major in the top byte, minor in bits 12-23 and
+    /// patch in bits 0-11, so "01.001.000" gives 0x01001000 and "01.000.000" gives 0x01000000.
     /// </summary>
     private static uint ContentVersionHigh(string contentVersion)
     {
         if (string.IsNullOrWhiteSpace(contentVersion)) return 0;
-        string major = contentVersion.Split('.')[0].Trim();
-        if (major.Length is 0 or > 2) return 0;
-        if (!byte.TryParse(major, System.Globalization.NumberStyles.None,
-                System.Globalization.CultureInfo.InvariantCulture, out byte mm))
-            return 0;
-        uint bcd = (uint)(((mm / 10) << 4) | (mm % 10));   // decimal major -> BCD (01 -> 0x01, 12 -> 0x12)
-        return bcd << 24;
+        string[] parts = contentVersion.Split('.');
+        if (parts.Length < 1) return 0;
+
+        if (!TryBcd(parts[0], 2, out uint major)) return 0;
+        uint minor = parts.Length > 1 && TryBcd(parts[1], 3, out uint m) ? m : 0;
+        uint patch = parts.Length > 2 && TryBcd(parts[2], 3, out uint p) ? p : 0;
+        return (major << 24) | (minor << 12) | patch;
+
+        // Packs up to "digits" decimal characters as one BCD nibble each ("001" -> 0x001).
+        static bool TryBcd(string field, int digits, out uint value)
+        {
+            value = 0;
+            string s = field.Trim();
+            if (s.Length == 0 || s.Length > digits) return false;
+            foreach (char c in s)
+            {
+                if (c is < '0' or > '9') return false;
+                value = (value << 4) | (uint)(c - '0');
+            }
+            return true;
+        }
     }
 
     /// <summary>

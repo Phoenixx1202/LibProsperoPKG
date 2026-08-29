@@ -171,19 +171,13 @@ public static class ProsperoFihBuilder
             }
         }
 
-        warnings.Add(
-            "The finalized image carries a valid embedded CNT and PFS image: the game-digest " +
-            "(0x30/0x70/0xD0) is SHA3-256 of the plaintext outer superblock, the CNT package-digest " +
-            "self-seal sits at CNT+0xFE0, and the GeneralDigests block (content/header/system/param/" +
-            "playgo/target) plus the per-entry digest table are SHA3-256 of the plaintext CNT regions " +
-            "and entries. " +
-            (nestedImageDigest is { Length: 32 }
-                ? "The FIH 0xB0 slot holds the nested-image-content digest from the build pass: " +
-                  "SHA3-256 of the uncompressed inner PFS image at its plain size."
-                : "The FIH 0xB0 slot holds a fallback SHA3-256 of the outer image: a standalone finalize " +
-                  "has only the encrypted CNT and cannot recover the plaintext inner image; the CNT build " +
-                  "path emits the nested-image-content digest.") +
-            " The image targets debug-mode consoles.");
+        // A standalone finalize has only the encrypted CNT, so it cannot recover the plaintext inner
+        // image and falls back to a digest of the outer image in the 0xB0 slot. That is worth saying,
+        // because the result differs from what the full build path produces; a normal build is not.
+        if (nestedImageDigest is not { Length: 32 })
+            warnings.Add(
+                "The nested-image-content digest was derived from the outer image because the inner image " +
+                "was not available to this pass. Build through the container path for the exact value.");
         log("Done (FIH).");
         return warnings;
     }
@@ -250,7 +244,7 @@ public static class ProsperoFihBuilder
             // so the plaintext superblock sits exactly one block (the naps file) after the inner image.
             //   0x90 inner-image (pfs_image.dat) block count = sbBlockIndex - 1
             //   0x94 = 0x98 inner content-inode count         = dirs+files below uroot (nwonly), threaded in
-            //   0x9C content-version echo                     = contentVersion major BCD << 24
+            //   0x9C content-version echo                     = contentVersion packed 2-3-3 BCD
             //   0xA0 block-aligned inner-image size           = 0x90 * blockSize
             //   0xA8 naps_pkg_layout.dat (map[0xD]) length    = nestedImageSize (the 0xB0 digest preimage length)
             //   0xB0 nested-image-content digest              = SHA3-256(naps_pkg_layout.dat) [written below]
@@ -271,7 +265,8 @@ public static class ProsperoFihBuilder
                 BinaryPrimitives.WriteUInt32LittleEndian(h.AsSpan(ProsperoPkgLayout.FihMetaBlockCountMirrorField), metaOrInodes);
                 BinaryPrimitives.WriteUInt64LittleEndian(h.AsSpan(ProsperoPkgLayout.FihInnerImageSizeField), (ulong)innerBlocks * (ulong)blockSize);
 
-                // 0x9C: content-version echo (high 32 bits of the param/content_ver u64; major BCD in the top byte).
+                // 0x9C: content-version echo (high 32 bits of the param/content_ver u64), the "MM.mmm.ppp"
+                // content version packed as 2-3-3 BCD digits.
                 if (nwonlyContentVersionHi != 0)
                     BinaryPrimitives.WriteUInt32LittleEndian(h.AsSpan(ProsperoPkgLayout.FihContentVersionField), nwonlyContentVersionHi);
 

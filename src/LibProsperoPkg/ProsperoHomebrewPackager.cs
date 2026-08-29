@@ -130,8 +130,11 @@ public static class ProsperoHomebrewPackager
         string modulePath = Path.Combine(homebrew, moduleName);
         if (!File.Exists(modulePath))
             throw new ArgumentException($"Compiled module '{moduleName}' was not found in the homebrew folder.", nameof(options));
-        if (ReadMagic(modulePath) != ElfMagic)
-            warnings.Add($"Module '{moduleName}' is not a raw ELF; the build's fake-sign step expects an ELF module.");
+        // A raw ELF is fake-signed during the build; an already-signed module is packed as it is. Only a
+        // module that is neither is worth reporting.
+        uint moduleMagic = ReadMagic(modulePath);
+        if (moduleMagic != ElfMagic && moduleMagic != LibProsperoPkg.Content.ProsperoFself.Magic)
+            warnings.Add($"Module '{moduleName}' is neither a raw ELF nor a signed module.");
 
         string sceSys = Path.Combine(homebrew, "sce_sys");
         var paramMeta = ReadParamMeta(Path.Combine(sceSys, "param.json"));

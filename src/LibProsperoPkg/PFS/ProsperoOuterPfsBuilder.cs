@@ -203,7 +203,10 @@ public static class ProsperoOuterPfsBuilder
         {
             ProsperoOuterFile f = files[i];
             ArgumentNullException.ThrowIfNull(f);
-            int blocks = Math.Max(1, (f.Data.Length + BlockSize - 1) / BlockSize);
+            long blockCount = Math.Max(1, ((long)f.Data.Length + BlockSize - 1) / BlockSize);
+            if (blockCount > int.MaxValue - dataBlockTotal)
+                throw new NotSupportedException($"Outer file '{f.Name}' is too large for the outer image layout.");
+            int blocks = (int)blockCount;
             fileFirstBlock[i] = dataBlockTotal;
             fileBlockCount[i] = blocks;
             dataBlockTotal += blocks;
@@ -218,7 +221,11 @@ public static class ProsperoOuterPfsBuilder
         // BlockSize/36 sig+block entries). The indirect block(s) are laid out after the FLT, before the uroot
         // dirents (the outer layout places pfs_image.dat's indirect block at D+4).
         const int DirectBlockSlots = 12;
-        const int IndirectBlockSlots = 5; // the inode ib[] table depth; each entry is one single-indirect block
+        // The inode ib[] table has five slots. Only ib[0] is corroborated by reference packages, which is
+        // enough for any inner image up to 12 + BlockSize/36 blocks (~114 MiB). Slots 1-4 are treated the
+        // same way, as further single-indirect blocks; that reading is not corroborated, so an inner image
+        // beyond ~114 MiB relies on it.
+        const int IndirectBlockSlots = 5;
         int indirectEntriesPerBlock = BlockSize / 36;
         var fileIndirectBlock = new int[files.Count];
         for (int i = 0; i < files.Count; i++) fileIndirectBlock[i] = -1;

@@ -729,8 +729,10 @@ public static class ProsperoPackageBuilder
             log($"Fake-signed {Path.GetRelativePath(sourceFolder, path)} ({bytes.Length} -> {fself.Length} bytes).");
         }
 
+        // Nothing to convert is the normal case for a tree whose modules are already fake-signed, so it
+        // is reported as progress rather than as a warning.
         if (restore.Count == 0)
-            warnings.Add("Module fake-signing was enabled but no raw ELF modules were found to convert.");
+            log("No raw ELF modules to fake-sign; the modules in the source tree are already signed.");
     }
 
     // Restores the original module bytes saved by PrepareFakeSelfModules. This runs during recovery, so
@@ -765,7 +767,6 @@ public static class ProsperoPackageBuilder
         Directory.CreateDirectory(sceSys);
         log("sce_sys/param.json not found - generating a minimal one from the supplied metadata.");
         File.WriteAllText(paramPath, BuildMinimalParamJson(options), new UTF8Encoding(false));
-        warnings.Add("A minimal param.json was generated; review it for store-grade packages.");
     }
 
     private static string BuildMinimalParamJson(ProsperoBuildOptions options)

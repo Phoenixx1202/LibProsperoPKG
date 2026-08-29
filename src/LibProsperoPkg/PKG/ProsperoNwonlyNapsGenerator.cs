@@ -77,24 +77,34 @@ public static class ProsperoNwonlyNapsGenerator
         // ---- Tail: padding blocks + metadata blocks + terminator ------------------------------------
         var tail = new List<NapsCblockPlanEntry>();
 
-        // Padding fills the logical gap [dataEnd, metaBase); each 256K block dedups to the block-info block.
-        long paddingBytes = metaBase - dataEnd;
-        int paddingBlocks = paddingBytes > 0 ? (int)((paddingBytes + Ublock256K - 1) / Ublock256K) : 0;
-        for (int k = 0; k < paddingBlocks; k++)
-            tail.Add(new NapsCblockPlanEntry
-            {
-                // Deduped padding blocks each re-anchor the on-disk cursor to the block-info block; the last
-                // one is absorbed into the following metadata RUN, so only the first N-1 open a RUN.
-                StartRun = k < paddingBlocks - 1,
-                OnDiskOffset = result.BlockInfoOnDiskOffset,
-                LogicalOffset = dataEnd + (long)k * Ublock256K,
-                EvenChunkCompressedLength = 8,
-                StreamLength = 0x10,
-                Even = 0,
-                Odd = 1,
-                KdePredictor = 4,
-                ShuffleIndex = 0,
-            });
+        // Padding covers the logical gap [dataEnd, metaBase) with a SINGLE bare STD cblock
+        // (StartRun = false, KdePredictor = 4). The entry decodes to zero-fill, consumes zero
+        // forward on-disk cursor progress, and shares the metadata anchor
+        // (`BlockInfoOnDiskOffset`) so the outer XTS tweak cursor stays consistent. The
+        // metadata Kraken cblock chain emitted below (KdePredictor = 2) covers
+        // [metaBase, mountSize) and the naps u2c mapping-entry for `metaBase >> 21` points
+        // directly at it — with only one padding entry (well before the metaBase U-block),
+        // `first[metaBase / Ublock256K]` resolves to the metadata Kraken cblock on the first
+        // probe and the phase-A/B backward walker in `read_naps_pfs_image_start` @
+        // k1001+0x5c3f10 is never invoked.
+        //
+        // `dataBlocks` is padded upstream (ProsperoPs5InnerImageAssembler) so `metaBase` lands
+        // on a U-block boundary; combined with the single-STD topology here, the walker returns
+        // cleanly and inner-sblock reads at Q = metaBase never fall through to
+        // `bread_naps_pfs_image_for_inner`'s `NAPS_MISS_BLKNO` sentinel.
+        long paddingStart = dataEnd & ~(Ublock256K - 1);
+        tail.Add(new NapsCblockPlanEntry
+        {
+            StartRun = false,
+            OnDiskOffset = result.BlockInfoOnDiskOffset,
+            LogicalOffset = paddingStart,
+            EvenChunkCompressedLength = 8,
+            StreamLength = 0x10,
+            Even = 0,
+            Odd = 1,
+            KdePredictor = 4,
+            ShuffleIndex = 0,
+        });
 
         // Metadata blocks: the assembler already captured the compressed metadata's per-256K-block chunk
         // table (ProsperoInnerMetaBlockChunk), so reuse it instead of Kraken-packing the metadata again.
