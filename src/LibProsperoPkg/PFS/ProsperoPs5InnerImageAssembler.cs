@@ -25,6 +25,12 @@ public sealed class ProsperoPs5InnerFile
 
     /// <summary>The uncompressed file bytes.</summary>
     public required byte[] Data { get; init; }
+
+    /// <summary>
+    /// How the image should treat this file. Leave null to classify it from its own header with
+    /// <see cref="ProsperoInnerFileClassifier"/>.
+    /// </summary>
+    public ProsperoInnerFilePolicy? Policy { get; init; }
 }
 
 /// <summary>The assembled inner image plus the intermediate model (for verification/diagnostics).</summary>
@@ -135,6 +141,7 @@ public sealed class ProsperoPs5InnerImageAssembler
         public uint Inode;
         public uint Afid;
         public bool StoreRaw;
+        public ProsperoInnerFilePolicy? Policy;
         public long LogicalOffset;
         public int DirentOffsetInParent = -1;
 
@@ -245,10 +252,17 @@ public sealed class ProsperoPs5InnerImageAssembler
             f.LogicalOffset = cursor;
             afidOffsets[f.Afid] = cursor;
             cursor += f.Data.Length;
-            // Keystone and executable modules are stored raw; every other file is Kraken-compressed and
-            // packed unless the compressed result does not save at least the store threshold. Compress once
-            // and reuse it so the data-region geometry and the final image share a single compression pass.
-            if (IsKeystone(f.FullPath) || IsExecutableModule(f.Data))
+            // A signed module is stored verbatim; every other file is submitted to the codec, which
+            // decides per block whether each one stays compressed. Compress once and reuse it so the
+            // data-region geometry and the final image share a single compression pass.
+            ProsperoInnerFilePolicy policy = f.Policy
+                ?? ProsperoInnerFileClassifier.Classify(
+                    f.Data.AsSpan(0, Math.Min(f.Data.Length, ProsperoInnerFileClassifier.HeaderLength)));
+            // An unsigned executable image is meant to become a signed module before it reaches the
+            // image; the caller owns that conversion. Reaching here with one is not an error, so it is
+            // stored as it stands rather than failing a build that would otherwise succeed.
+            if (policy == ProsperoInnerFilePolicy.StoreVerbatim
+                || policy == ProsperoInnerFilePolicy.RequiresModuleConversion)
             {
                 f.StoreRaw = true;
                 f.OnDiskData = f.Data;
@@ -256,8 +270,8 @@ public sealed class ProsperoPs5InnerImageAssembler
             else
             {
                 byte[] comp = ProsperoPs5InnerImageBuilder.CompressPayload(f.Data, storeRaw: false);
-                f.StoreRaw = comp.Length >= f.Data.Length; // CompressPayload returns raw when it does not help
-                f.OnDiskData = f.StoreRaw ? f.Data : comp;
+                f.StoreRaw = ReferenceEquals(comp, f.Data);
+                f.OnDiskData = comp;
             }
             f.SceSys = f.FullPath.StartsWith("/sce_sys/", StringComparison.Ordinal);
             f.WholeBlockRaw = IsKeystone(f.FullPath);
@@ -270,10 +284,11 @@ public sealed class ProsperoPs5InnerImageAssembler
 
         // Pad dataBlocks up so that `metaBase = (dataBlocks + 63) * BlockSize` and the inner sblock at
         // `(dataBlocks + 61) * BlockSize` land on U-block boundaries (= 4 * BlockSize = 0x40000). This is
-        // the invariant (dataBlocks=75 → (75+61)%4 == 0) that lets the kernel's
+        // the Sony DebugSettings.pkg invariant (dataBlocks=75 → (75+61)%4 == 0) that lets the kernel's
         // u2c mapping-entry point DIRECTLY at the metadata Kraken cblock in
         // `read_naps_pfs_image_start` @ k1001+0x5c3f10 without a mid-U-block straddle. Padding is
         // purely logical (no physical bytes) — the naps padding cblock chain covers the gap.
+        // Grounded in Reversed/inner-pfs-readvolumesize-origin.md addendum "post-v0.7.6".
         while ((dataBlocks + 61) % 4 != 0)
             dataBlocks++;
 
@@ -353,6 +368,7 @@ public sealed class ProsperoPs5InnerImageAssembler
                 Name = name,
                 FullPath = "/" + path,
                 Data = f.Data,
+                Policy = f.Policy,
                 Parent = parent,
             });
         }
@@ -392,9 +408,10 @@ public sealed class ProsperoPs5InnerImageAssembler
     private static bool IsKeystone(string fullPath) =>
         string.Equals(fullPath, "/sce_sys/keystone", StringComparison.Ordinal);
 
-    // Executable modules are stored raw (uncompressed) in the nwonly inner. The console memory-maps
-    // modules directly, so compression is skipped. Detected by container magic: plaintext SELF
-    // (0x1D3D154F), module container (0xEEF51454), or raw executable image (0x464C457F).
+    // Predicate behind the metadata inode's module flag. It is deliberately separate from the
+    // compress-versus-store policy in ProsperoInnerFileClassifier: the two answer different questions.
+    // Which magics the inode flag covers has not been measured against a reference image containing a
+    // plaintext module or a raw executable, so this keeps the wider set it has always used.
     private static bool IsExecutableModule(byte[] data)
     {
         if (data.Length < 4) return false;

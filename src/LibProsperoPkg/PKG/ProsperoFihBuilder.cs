@@ -197,7 +197,8 @@ public static class ProsperoFihBuilder
         ProsperoFihVariant variant, ulong pfsImageSize, ulong embeddedCntOffset,
         byte[] image, System.Collections.Generic.List<string>? warnings = null,
         byte[]? nestedImageDigest = null, long nestedImageSize = 0, long nestedMetaBaseBlocks = 0,
-        uint nwonlyContentVersionHi = 0, int nwonlyInnerContentInodes = 0, int nwonlyAppFileCount = 0)
+        uint nwonlyContentVersionHi = 0, int nwonlyInnerContentInodes = 0, int nwonlyAppFileCount = 0,
+        long nwonlyNdblock = 0)
     {
         byte[] h = new byte[ProsperoPkgLayout.FihHeaderRegionSize];
 
@@ -217,8 +218,12 @@ public static class ProsperoFihBuilder
         BinaryPrimitives.WriteUInt64LittleEndian(h.AsSpan(0x60), (ulong)ProsperoPkgLayout.FihHeaderRegionSize);
         BinaryPrimitives.WriteUInt64LittleEndian(h.AsSpan(0x68), 0x800000000000UL);
 
-        // 0x50 = the inner mount's data-region block count (= metaBase block index = MetaBaseLogical / 64KiB).
-        // The installer's transfer reads this to size the mount's data region; a zero value is rejected.
+        // 0x50 = the inner mount's data-region block count (= metaBase block index). SceShellCore
+        // computes FIH[0x50] * FIH[0x60] and stores it as ppkg_opt[+0x30] = inner_sblock_offset, which
+        // the kernel passes to read_sblock_wo_icv as the byte offset where the inner PFS superblock is
+        // read. This MUST be metaBase (= nestedMetaBaseBlocks * blockSize), NOT Ndblock — the sblock
+        // sits at metaBase, not at the logical mount end. The lvd3 mediasize comes independently from
+        // sceKernelStat (the file's st_size), not from any FIH field.
         if (nestedMetaBaseBlocks > 0)
             BinaryPrimitives.WriteUInt64LittleEndian(h.AsSpan(ProsperoPkgLayout.FihDataRegionBlockCountField), (ulong)nestedMetaBaseBlocks);
 
@@ -259,11 +264,19 @@ public static class ProsperoFihBuilder
                 uint innerBlocks = (uint)(sbBlockIndex - 1);
                 // 0x94/0x98: the inner content-inode count for the data-first nwonly image: dirs and files
                 // below uroot. The legacy non-nwonly path keeps its outer meta-block count.
+                //
+                // Reference packages also satisfy 0x90 + 0x98 == outer block count, and every reference
+                // measured so far gives the same number for both readings, so the corpus cannot tell them
+                // apart. The consumer of the field has not been identified either, so the reading that has
+                // produced installable packages is kept until something decides it.
                 uint metaOrInodes = nwonly ? (uint)nwonlyInnerContentInodes : (uint)(totalBlocks - innerBlocks);
                 BinaryPrimitives.WriteUInt32LittleEndian(h.AsSpan(ProsperoPkgLayout.FihInnerImageBlockCountField), innerBlocks);
                 BinaryPrimitives.WriteUInt32LittleEndian(h.AsSpan(ProsperoPkgLayout.FihMetaBlockCountField), metaOrInodes);
                 BinaryPrimitives.WriteUInt32LittleEndian(h.AsSpan(ProsperoPkgLayout.FihMetaBlockCountMirrorField), metaOrInodes);
-                BinaryPrimitives.WriteUInt64LittleEndian(h.AsSpan(ProsperoPkgLayout.FihInnerImageSizeField), (ulong)innerBlocks * (ulong)blockSize);
+                ulong innerImageFieldValue = nwonlyNdblock > 0
+                    ? (ulong)nwonlyNdblock * (ulong)blockSize
+                    : (ulong)innerBlocks * (ulong)blockSize;
+                BinaryPrimitives.WriteUInt64LittleEndian(h.AsSpan(ProsperoPkgLayout.FihInnerImageSizeField), innerImageFieldValue);
 
                 // 0x9C: content-version echo (high 32 bits of the param/content_ver u64), the "MM.mmm.ppp"
                 // content version packed as 2-3-3 BCD digits.

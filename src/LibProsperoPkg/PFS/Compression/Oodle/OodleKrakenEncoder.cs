@@ -55,6 +55,19 @@ namespace LibProsperoPkg.PFS.Compression.Oodle;
 /// The result of compressing one PFS block: the section-7 payload plus the metadata the boundary
 /// table needs (whether the block was split into two chunks, and the first chunk's compressed size).
 /// </summary>
+/// <summary>The form a block's sub-chunk takes on disk.</summary>
+internal enum KrakenSubChunkForm
+{
+    /// <summary>A coded LZ sub-chunk.</summary>
+    Lz,
+
+    /// <summary>A single entropy array covering the whole sub-chunk, with no LZ table.</summary>
+    BareEntropy,
+
+    /// <summary>The sub-chunk's uncompressed bytes, copied.</summary>
+    Verbatim,
+}
+
 internal readonly struct EncodedBlock
 {
     /// <summary>The bytes that land in section 7 for this block (one or two concatenated chunks).</summary>
@@ -66,11 +79,30 @@ internal readonly struct EncodedBlock
     /// <summary>The compressed size of the first chunk (the value stored, minus one, in the size hint).</summary>
     public readonly int FirstChunkCompSize;
 
-    public EncodedBlock(byte[] payload, bool multiChunk, int firstChunkCompSize)
+    /// <summary>The literal model the first sub-chunk used: 0 = sub/delta, 1 = raw.</summary>
+    public readonly int Chunk0LitMode;
+
+    /// <summary>The literal model the second sub-chunk used, or 1 when the block has one sub-chunk.</summary>
+    public readonly int Chunk1LitMode;
+
+    /// <summary>The form the first sub-chunk took.</summary>
+    public readonly KrakenSubChunkForm Chunk0Form;
+
+    /// <summary>The form the second sub-chunk took; meaningless when the block has one sub-chunk.</summary>
+    public readonly KrakenSubChunkForm Chunk1Form;
+
+    public EncodedBlock(byte[] payload, bool multiChunk, int firstChunkCompSize,
+        int chunk0LitMode = 1, int chunk1LitMode = 1,
+        KrakenSubChunkForm chunk0Form = KrakenSubChunkForm.Lz,
+        KrakenSubChunkForm chunk1Form = KrakenSubChunkForm.Lz)
     {
         Payload = payload;
         MultiChunk = multiChunk;
         FirstChunkCompSize = firstChunkCompSize;
+        Chunk0LitMode = chunk0LitMode;
+        Chunk1LitMode = chunk1LitMode;
+        Chunk0Form = chunk0Form;
+        Chunk1Form = chunk1Form;
     }
 }
 
@@ -101,7 +133,8 @@ internal readonly struct EncodedBlock
 internal static class OodleKrakenEncoder
 {
     private const int ChunkMax = 0x20000;       // a single newLZ chunk decodes at most 128 KiB
-    private const int MinChunk = 64;            // below this, storing raw is never worse
+    private const int MinChunk = 128;           // a coded chunk must expand to at least this many bytes
+    private const int TinyChunk = 0x20;         // a shorter sub-chunk is copied without any comparison
     private const int MinMatch = 4;
     private const int MinRepMatch = 2;          // a repeat-offset match costs no offset, so length 2 can pay
     private const int MinDistance = 8;          // recent-offset init is -8; shorter distances are illegal
@@ -109,7 +142,6 @@ internal static class OodleKrakenEncoder
     private const int NoMatchZone = 16;         // a match may not START in the last 16 bytes of a chunk (match_zone_end = chunkEnd-16)
     private const int MaxMatch = 271;           // split path caps matchlen-17 <= 254 (packed_litlen < 255); a lone over-long match instead uses the single match-length escape
     private const int MaxArrayLength = 0x3FFFF; // DecodeBytes raw 3-byte size limit
-    private const int MaxFirstChunkComp = 0x1FFFF; // size hint is 17-bit; first chunk must fit
     private const int MaxChainWalk = 128;
     private const int HashBits = 17;
     private const int HashSize = 1 << HashBits;
@@ -135,62 +167,228 @@ internal static class OodleKrakenEncoder
     }
 
     /// <summary>
-    /// Compresses <paramref name="data"/> (one PFS block) into a section-7 payload of one or two
-    /// newLZ chunks, or returns null if the data is too small or does not compress below its original
-    /// size.
+    /// Compresses <paramref name="data"/> (one PFS block) into a section-7 payload, or returns null
+    /// when the block must be stored whole.
     /// </summary>
     public static EncodedBlock? EncodeBlock(ReadOnlySpan<byte> data) => EncodeBlock(data, useHuffmanArrays: false);
 
     /// <summary>
-    /// Compresses <paramref name="data"/> (one PFS block) into a section-7 payload of one or two
-    /// newLZ chunks, or returns null if the data is too small or does not compress below its original
-    /// size. When <paramref name="useHuffmanArrays"/> is true
-    /// the literal/command/length arrays are Huffman-coded (entropy chunk type 2) via
-    /// <see cref="KrakenHuffmanArrayEncoder"/> when that is smaller than the raw form, shrinking actual
-    /// blocks toward their target sizes. The packed-offset array is always left raw because the offset
-    /// reader inspects its first byte (the 0x80 bit selects two-table mode), which an entropy header
-    /// would corrupt.
+    /// Compresses <paramref name="data"/> (one PFS block) into a section-7 payload, or returns null when
+    /// the block must be stored whole. The block is split into sub-chunks of at most
+    /// <see cref="ChunkMax"/> uncompressed bytes, and each sub-chunk independently takes the cheapest of
+    /// three forms: an LZ sub-chunk, a single entropy array over the whole sub-chunk, or a verbatim copy.
+    /// When <paramref name="useHuffmanArrays"/> is set the streams inside an LZ sub-chunk are entropy
+    /// coded wherever that wins the array score.
     /// </summary>
     public static EncodedBlock? EncodeBlock(ReadOnlySpan<byte> data, bool useHuffmanArrays)
     {
         int n = data.Length;
+        // A block below the minimum coded chunk size is never coded at all.
         if (n < MinChunk)
-            return null; // not worth it; caller stores raw
+            return null;
+        // A larger block cannot be described by the single first-sub-chunk size hint.
+        if (n > 2 * ChunkMax)
+            return null;
 
         var head = new int[HashSize];
         var prev = new int[n];
         head.AsSpan().Fill(-1);
 
-        if (n <= ChunkMax)
+        // The match table is built once over the whole block and sliced by the sub-chunk parsers, so a
+        // second sub-chunk's matches can reach back into the first. Matches never leave the block.
+        int[]? savedTable = MatchTable;
+        MatchTable = BuildMatchTable(data);
+        CarriedPassinfo = null;
+        CarriedLitMode = -1;
+        PendingCarryPassinfo = null;
+        try
         {
-            byte[]? single = EncodeChunk(data, head, prev, 0, n, withSeed: true, useHuffmanArrays, allowOptimal: true);
-            if (single is null || single.Length >= n)
+            int chunk0End = n < ChunkMax ? n : ChunkMax;
+            bool blockConstant = IsConstantRun(data);
+            EncodedSubChunk sub0 = EncodeSubChunk(data, head, prev, 0, chunk0End, isFirst: true, useHuffmanArrays, blockConstant);
+            if (sub0.Payload is null)
                 return null;
-            return new EncodedBlock(single, multiChunk: false, single.Length);
+            if (chunk0End == n)
+            {
+                // One sub-chunk. A single verbatim sub-chunk is exactly a stored block, so it is left to
+                // the stored path.
+                if (sub0.Form == KrakenSubChunkForm.Verbatim || sub0.Payload.Length >= n)
+                    return null;
+                return new EncodedBlock(sub0.Payload, multiChunk: false, sub0.Payload.Length,
+                    sub0.LitMode, 1, sub0.Form, KrakenSubChunkForm.Verbatim);
+            }
+
+            EncodedSubChunk sub1 = EncodeSubChunk(data, head, prev, chunk0End, n, isFirst: false, useHuffmanArrays, blockConstant);
+            if (sub1.Payload is null)
+                return null;
+            // The frame header cannot express a block whose sub-chunks are both verbatim, and such a
+            // block never beats storing anyway.
+            if (sub0.Form == KrakenSubChunkForm.Verbatim && sub1.Form == KrakenSubChunkForm.Verbatim)
+                return null;
+            if (sub0.Payload.Length > ChunkMax)
+                return null;
+
+            var payload = new byte[sub0.Payload.Length + sub1.Payload.Length];
+            Buffer.BlockCopy(sub0.Payload, 0, payload, 0, sub0.Payload.Length);
+            Buffer.BlockCopy(sub1.Payload, 0, payload, sub0.Payload.Length, sub1.Payload.Length);
+            if (payload.Length >= n)
+                return null;
+            return new EncodedBlock(payload, multiChunk: true, sub0.Payload.Length,
+                sub0.LitMode, sub1.LitMode, sub0.Form, sub1.Form);
+        }
+        finally
+        {
+            MatchTable = savedTable;
+            CarriedPassinfo = null;
+            CarriedLitMode = -1;
+            PendingCarryPassinfo = null;
+        }
+    }
+
+    /// <summary>One encoded sub-chunk: its container payload, the form it took and its literal model.</summary>
+    private readonly struct EncodedSubChunk
+    {
+        public readonly byte[]? Payload;
+        public readonly KrakenSubChunkForm Form;
+        public readonly int LitMode;
+
+        public EncodedSubChunk(byte[]? payload, KrakenSubChunkForm form, int litMode)
+        {
+            Payload = payload;
+            Form = form;
+            LitMode = litMode;
+        }
+    }
+
+    /// <summary>Decode-time weight of a verbatim copy, in the units the array score model uses.</summary>
+    private static float CopyDecodeTime(int length) => length * 0.0625f;
+
+    /// <summary>
+    /// The deadline the whole-sub-chunk entropy array has to meet. It is not applied to the arrays
+    /// inside an LZ sub-chunk.
+    /// </summary>
+    private static float WholeChunkDeadline(int length) => length * 0.57f - 50.0f;
+
+    /// <summary>
+    /// Encodes one sub-chunk in whichever of the three forms scores best. The order is fixed. When the
+    /// whole block is one repeated byte, every sub-chunk long enough to beat the eight-byte array takes
+    /// it and the rest are copied. Otherwise a sub-chunk below <see cref="TinyChunk"/> bytes is copied
+    /// without any comparison, a sub-chunk that is itself one repeated byte becomes the eight-byte array
+    /// without any comparison, and everything else is scored across the LZ form, the whole-sub-chunk
+    /// entropy array and the verbatim copy. Ties move away from the LZ form and toward the copy.
+    /// </summary>
+    private static EncodedSubChunk EncodeSubChunk(ReadOnlySpan<byte> data, int[] head, int[] prev,
+        int chunkStart, int chunkEnd, bool isFirst, bool useHuffmanArrays, bool blockConstant)
+    {
+        int length = chunkEnd - chunkStart;
+        ReadOnlySpan<byte> chunk = data.Slice(chunkStart, length);
+
+        if (blockConstant)
+        {
+            return length > ConstantRunArrayLength
+                ? new EncodedSubChunk(ConstantRunArray(chunk[0], length), KrakenSubChunkForm.BareEntropy, 1)
+                : new EncodedSubChunk(chunk.ToArray(), KrakenSubChunkForm.Verbatim, 1);
         }
 
-        // blockSize is at most 0x40000 (two chunks). A larger block cannot be described by the single
-        // first-chunk size hint, so leave it to the stored path.
-        if (n > 2 * ChunkMax)
-            return null;
+        if (length < TinyChunk)
+            return new EncodedSubChunk(chunk.ToArray(), KrakenSubChunkForm.Verbatim, 1);
 
-        byte[]? chunk0 = EncodeChunk(data, head, prev, 0, ChunkMax, withSeed: true, useHuffmanArrays, allowOptimal: true);
-        if (chunk0 is null || chunk0.Length > MaxFirstChunkComp || chunk0.Length >= ChunkMax)
-            return null;
+        if (IsConstantRun(chunk))
+            return new EncodedSubChunk(ConstantRunArray(chunk[0], length), KrakenSubChunkForm.BareEntropy, 1);
 
-        byte[]? chunk1 = EncodeChunk(data, head, prev, ChunkMax, n, withSeed: false, useHuffmanArrays, allowOptimal: true);
-        // A second chunk that does not compress below its own size (e.g. an incompressible tail) would be
-        // emitted as a degenerate all-literal chunk. Store the whole block instead, matching the
-        // single-chunk path's `single.Length >= n` decision.
-        if (chunk1 is null || chunk1.Length >= n - ChunkMax)
-            return null;
+        float copyScore = length + 3.0f + ArrayLambda * CopyDecodeTime(length);
 
-        var payload = new byte[chunk0.Length + chunk1.Length];
-        Buffer.BlockCopy(chunk0, 0, payload, 0, chunk0.Length);
-        Buffer.BlockCopy(chunk1, 0, payload, chunk0.Length, chunk1.Length);
-        if (payload.Length >= n)
+        byte[]? lz = null;
+        int lzLitMode = 1;
+        float lzScore = float.MaxValue;
+        if (length > MinChunk)
+        {
+            lz = EncodeChunk(data, head, prev, chunkStart, chunkEnd, withSeed: isFirst, useHuffmanArrays,
+                out lzLitMode, out float lzArrayScore, allowOptimal: true);
+            if (lz is not null && lz.Length < length)
+                lzScore = lzArrayScore + 3.0f;
+            else
+                lz = null;
+        }
+
+        // The whole-sub-chunk array is offered the better of the two other forms as its ceiling, and it
+        // additionally has to decode within the deadline.
+        float arrayBudget = lzScore < copyScore ? lzScore : copyScore;
+        float bareScore = float.MaxValue;
+        byte[]? bare = useHuffmanArrays ? TryWholeChunkArray(chunk, arrayBudget, out bareScore) : null;
+
+        if (lz is not null && lzScore < copyScore && lzScore <= bareScore)
+            return new EncodedSubChunk(lz, KrakenSubChunkForm.Lz, lzLitMode);
+        if (bare is null || copyScore <= bareScore)
+            return new EncodedSubChunk(chunk.ToArray(), KrakenSubChunkForm.Verbatim, 1);
+        return new EncodedSubChunk(bare, KrakenSubChunkForm.BareEntropy, 1);
+    }
+
+    private static bool IsConstantRun(ReadOnlySpan<byte> chunk)
+    {
+        byte first = chunk[0];
+        for (int i = 1; i < chunk.Length; i++)
+            if (chunk[i] != first)
+                return false;
+        return true;
+    }
+
+    /// <summary>Bytes the constant-run form occupies; a sub-chunk this short is copied instead.</summary>
+    private const int ConstantRunArrayLength = KrakenHuffmanArrayEncoder.SingleSymbolArrayLength;
+
+    /// <summary>The eight-byte form a constant run takes, as a whole sub-chunk.</summary>
+    private static byte[] ConstantRunArray(byte value, int length)
+        => KrakenHuffmanArrayEncoder.BuildSingleSymbolArray(value, length);
+
+    /// <summary>
+    /// Encodes the whole sub-chunk as a single entropy array, or returns null when it does not beat
+    /// <paramref name="budget"/>, misses the decode deadline, or does not come out below the raw size.
+    /// </summary>
+    private static byte[]? TryWholeChunkArray(ReadOnlySpan<byte> chunk, float budget, out float score)
+    {
+        score = float.MaxValue;
+        int length = chunk.Length;
+        var prepared = KrakenHuffmanArrayEncoder.Prepare(chunk, out KrakenHuffmanArrayEncoder.CostInputs cost);
+        if (prepared is null)
             return null;
-        return new EncodedBlock(payload, multiChunk: true, chunk0.Length);
+        if (prepared.SingleSymbol)
+        {
+            // A constant sub-chunk is handled before this point, so this only sees a constant array
+            // reached through some other path; score it with its own model.
+            float memsetScore = ArrayLambda * CopyDecodeTime(length) + KrakenHuffmanArrayEncoder.SingleSymbolArrayLength;
+            if (memsetScore >= (budget < length + RawArrayHeader ? budget : length + RawArrayHeader))
+                return null;
+            score = memsetScore;
+            return KrakenHuffmanArrayEncoder.Finish(chunk, prepared);
+        }
+        float time = ArrayDecodeTime(length, cost.NonZeroSymbols, cost.AlphabetRuns,
+            (float)cost.CodeLengthBits / length);
+        if (time > WholeChunkDeadline(length))
+            return null;
+        float cap = budget < length + RawArrayHeader ? budget : length + RawArrayHeader;
+        float overhead = ArrayLambda * time + ArrayCompressedBias;
+        float estimate = ((cost.CodeLengthBits + 7) >> 3) + 13 + cost.HeaderBytes;
+        if (estimate + overhead >= cap)
+            return null;
+        byte[]? huff = KrakenHuffmanArrayEncoder.Finish(chunk, prepared);
+        if (huff is null || huff.Length >= length)
+            return null;
+        score = huff.Length + overhead;
+        return score < length + RawArrayHeader ? huff : null;
+    }
+
+    /// <summary>
+    /// The per-position match table for the block currently being encoded: four length/offset pairs per
+    /// position, shared by the greedy pre-passes and the forward DP.
+    /// </summary>
+    [ThreadStatic] internal static int[]? MatchTable;
+
+    private static int[] BuildMatchTable(ReadOnlySpan<byte> data)
+    {
+        var block = data.ToArray();
+        var table = new int[Math.Max(1, block.Length) * KrakenSuffixTrieMatcher.IntsPerPosition];
+        new KrakenSuffixTrieMatcher(block).Run(table);
+        return table;
     }
 
     /// <summary>
@@ -201,8 +399,11 @@ internal static class OodleKrakenEncoder
     /// chunk decoded at a non-zero output offset).
     /// </summary>
     private static byte[]? EncodeChunk(ReadOnlySpan<byte> data, int[] head, int[] prev,
-        int chunkStart, int chunkEnd, bool withSeed, bool useHuffmanArrays, bool allowOptimal = false)
+        int chunkStart, int chunkEnd, bool withSeed, bool useHuffmanArrays, out int litMode,
+        out float score, bool allowOptimal = false)
     {
+        litMode = 1;
+        score = float.MaxValue;
         int matchLimit = chunkEnd - LiteralTail; // a match may EXTEND up to here, so >= LiteralTail trailing literals remain
         // The newLZ decoder forbids a match from STARTING in the last 16 bytes of a chunk. Its release
         // parse loop (the algorithm) enforces `match_zone_end - to_ptr >= lrl` with
@@ -245,19 +446,19 @@ internal static class OodleKrakenEncoder
         List<Command> commands;
         if (optimal)
         {
-            bool savedMml3 = UseDpMml3, savedWin = UseWindowedParse, savedFront = UseFrontierGate, savedTiny = UseTinyOffsetRemap, savedSkip = UseLongMatchSkip;
+            bool savedMml3 = UseDpMml3, savedWin = UseWindowedParse, savedFront = UseFrontierGate, savedTiny = UseTinyOffsetRemap;
             UseDpMml3 = true;
             // Enable windowing plus long-match skipping for the large-block path while leaving the
             // monolithic small-block path untouched. The long-match skip replaces the earlier
             // cross-position frontier gate, which over-suppressed candidates; with the skip enabled,
             // disabling the frontier gate keeps the windowed DP aligned with the intended parse.
-            if (blockOptimalWindowed && !UseOptimalParse) { UseWindowedParse = true; UseFrontierGate = false; UseLongMatchSkip = true; UseTinyOffsetRemap = true; }
+            if (blockOptimalWindowed && !UseOptimalParse) { UseWindowedParse = true; UseFrontierGate = false; UseTinyOffsetRemap = true; }
             try
             {
                 commands = ParseOptimal(data, head, prev, firstMatchPos, firstMatchPos, matchLimit, matchStartLimit,
                     chunkStart, chunkEnd, withSeed, useHuffmanArrays);
             }
-            finally { UseDpMml3 = savedMml3; UseWindowedParse = savedWin; UseFrontierGate = savedFront; UseTinyOffsetRemap = savedTiny; UseLongMatchSkip = savedSkip; }
+            finally { UseDpMml3 = savedMml3; UseWindowedParse = savedWin; UseFrontierGate = savedFront; UseTinyOffsetRemap = savedTiny; }
         }
         else
         {
@@ -266,13 +467,18 @@ internal static class OodleKrakenEncoder
         if (commands.Count == 0)
             return null;
 
-        // Shipping validity path: raw literals (litMode 1). The literal mode is signaled OUT-OF-BAND
-        // by the PFS boundary-table flag bit (KrakenDecoder.DecodeBlock reads chunk0 0x01 /
-        // chunk1 0x10: set = sub, clear = raw), so the emitted literal-array content and that flag must
-        // agree. Emitting the cheaper SUB array (ChooseLitMode) requires also setting that flag in
-        // the block builder; that end-to-end sub plumbing belongs to the byte-identity (UseOptimalParse)
-        // path, so the validity deliverable stays raw and round-trips green.
-        return EmitChunkFromCommands(data, commands, chunkStart, chunkEnd, withSeed, useHuffmanArrays, litMode: 1);
+        // The literal model is chosen per chunk and signalled out of band by the boundary-table flag
+        // bit (sub-chunk 0 bit 0x01, sub-chunk 1 bit 0x10), so the chosen model travels back to the
+        // container writer alongside the bytes.
+        byte[]? chunkBytes = EmitChunkFromCommands(data, commands, chunkStart, chunkEnd, withSeed,
+            useHuffmanArrays, litMode: -1, out litMode, out score);
+        if (PendingCarryPassinfo is not null && chunkBytes is not null)
+        {
+            CarriedPassinfo = PendingCarryPassinfo;
+            CarriedLitMode = litMode;
+        }
+        PendingCarryPassinfo = null;
+        return chunkBytes;
     }
 
     /// <summary>
@@ -284,8 +490,21 @@ internal static class OodleKrakenEncoder
     /// fallback (a literal run over MaxLitRun or a match starting inside the no-match zone).
     /// </summary>
     private static byte[]? EmitChunkFromCommands(ReadOnlySpan<byte> data, List<Command> commands,
-        int chunkStart, int chunkEnd, bool withSeed, bool useHuffmanArrays, int litMode = 1)
+        int chunkStart, int chunkEnd, bool withSeed, bool useHuffmanArrays, int litMode,
+        out int chosenLitMode)
+        => EmitChunkFromCommands(data, commands, chunkStart, chunkEnd, withSeed, useHuffmanArrays,
+            litMode, out chosenLitMode, out _);
+
+    /// <summary>
+    /// As the other overload, and also reports the chunk's score: the arrays contribute the score the
+    /// array writer assigned them and every other byte contributes itself.
+    /// </summary>
+    private static byte[]? EmitChunkFromCommands(ReadOnlySpan<byte> data, List<Command> commands,
+        int chunkStart, int chunkEnd, bool withSeed, bool useHuffmanArrays, int litMode,
+        out int chosenLitMode, out float score)
     {
+        chosenLitMode = 1;
+        score = 0.0f;
         int matchStartLimit = chunkEnd - NoMatchZone;
         // Store-raw safety net: a match may not start inside the no-match zone (the last 16 bytes of the
         // chunk). The parser already enforces this, so in practice this never triggers.
@@ -376,10 +595,8 @@ internal static class OodleKrakenEncoder
         // model. The encoder keeps whichever
         // yields the smaller entropy-coded literal array; litMode forces it (0 = sub, 1 = raw) for
         // diagnostics, -1 = auto (ChooseLitMode = the validated decision).
-        List<byte> lit;
-        if (litMode == 0) lit = litSub;
-        else if (litMode == 1) lit = litRaw;
-        else lit = ChooseLitMode(litRaw, litSub, useHuffmanArrays) == 0 ? litSub : litRaw;
+        chosenLitMode = litMode >= 0 ? litMode : ChooseLitMode(litRaw, litSub, useHuffmanArrays);
+        List<byte> lit = chosenLitMode == 0 ? litSub : litRaw;
 
         byte[] forwardBytes = forward.ToBytes();
         byte[] backwardBytes = backward.ToBytes();
@@ -418,16 +635,18 @@ internal static class OodleKrakenEncoder
             outBuf.Add((byte)(CtrlExcessMode | 0x20 | (excessCount & 0x1F)));
             outBuf.Add((byte)((excessCount >> 5) - 1));
         }
-        WriteArray(outBuf, lit, useHuffmanArrays);
-        WriteArray(outBuf, cmdStream, useHuffmanArrays);
+        int arrayStart = outBuf.Count;
+        score += WriteArray(outBuf, lit, useHuffmanArrays);
+        score += WriteArray(outBuf, cmdStream, useHuffmanArrays);
         // packed_offs: Huffman-code this array when beneficial (single-table offset mode).
         // The offset-mode reader inspects this array's first byte for bit 0x80 (set = two-table scaling
         // byte). KrakenHuffmanArrayEncoder always emits the 5-byte long-form entropy header whose first
         // byte is (chunkType<<4)|... = 0x20..0x2F for chunkType 2 (bit 0x80 CLEAR), and a raw array's
         // first byte is (len>>16) <= 3 (also clear), so either form stays in single-table mode.
         // A previous validity-only version forced this raw; Huffman form is needed for text/data offsets.
-        WriteArray(outBuf, packedOffs, useHuffmanArrays);
-        WriteArray(outBuf, packedLitLen, useHuffmanArrays);
+        score += WriteArray(outBuf, packedOffs, useHuffmanArrays);
+        score += WriteArray(outBuf, packedLitLen, useHuffmanArrays);
+        int arrayBytes = outBuf.Count - arrayStart;
         // main dual bitstream region = forward ++ reverse(backward)
         outBuf.AddRange(forwardBytes);
         for (int i = backwardBytes.Length - 1; i >= 0; i--)
@@ -437,6 +656,8 @@ internal static class OodleKrakenEncoder
         for (int i = excessBwd.Length - 1; i >= 0; i--)
             outBuf.Add(excessBwd[i]);
 
+        // Every byte outside the four arrays contributes its own size to the score.
+        score += outBuf.Count - arrayBytes;
         return outBuf.ToArray();
     }
 
@@ -479,23 +700,23 @@ internal static class OodleKrakenEncoder
         }
     }
 
-    // Literal-mode decision for optimal level 7: chooses sub vs raw.
-    // * literal_count < 32 -> raw (1).
-    // * else encode BOTH literal arrays for actual (array histogram encoder / our M2 array calc) and keep
-    // the cheaper. Sub is evaluated first against the running budget; raw replaces it only when
-    // STRICTLY cheaper (put_array_histo's budget ceiling is the incumbent sub cost), so sub wins
-    // ties. Level 7 (`5 < level`) skips the level<=5 entropy-estimate pre-pick and compares the
-    // actual encoded sizes directly. (The lambda space-speed term is 0 for a pure -lvl 7 ratio run.)
-    // Returns 0 = sub, 1 = raw.
+    /// <summary>
+    /// Chooses the chunk's literal model: 0 = sub/delta, 1 = raw. The sub candidate is offered first and
+    /// becomes the budget the raw candidate must beat, so three rules apply in order: fewer than 32
+    /// literals always take raw; a sub array that does not encode smaller than the literal count is
+    /// discarded and raw is taken; otherwise raw wins only when it is strictly smaller, so an exact tie
+    /// keeps sub. The sizes are the exact byte lengths the array emitter would write.
+    /// </summary>
     internal static int ChooseLitMode(List<byte> litRaw, List<byte> litSub, bool useHuffmanArrays)
     {
-        if (litSub.Count < 32) return 1; // raw: too few literals to entropy-code a sub stream
-        int subSize = EncodedArraySize(litSub, useHuffmanArrays);
-        int rawSize = EncodedArraySize(litRaw, useHuffmanArrays);
-        // Prefer RAW on a tie: a near-constant block can make the sub/delta transform entropy-code
-        // to the same size as raw, and raw preserves the intended literal stream. Sub still wins when
-        // it is strictly smaller.
-        return rawSize <= subSize ? 1 : 0;
+        int n = litSub.Count;
+        if (n < 32) return 1;
+        float budget = float.MaxValue;
+        PutArray(litSub, useHuffmanArrays, ref budget, out _, out int subSize);
+        if (subSize >= n) return 1;
+        // The raw candidate is offered the sub candidate's score as its ceiling, so it replaces sub only
+        // when it is strictly cheaper; the writer declines outright on a tie.
+        return PutArray(litRaw, useHuffmanArrays, ref budget, out _, out _) ? 1 : 0;
     }
 
     // Convenience overload: choose the litMode a parse would emit, used to seed the DP cost build
@@ -510,63 +731,127 @@ internal static class OodleKrakenEncoder
         return ChooseLitMode(litRaw, litSub, useHuffmanArrays);
     }
 
-    private static int EncodedArraySize(List<byte> array, bool useHuffman)
-    {
-        int raw = array.Count + 3;
-        if (useHuffman && array.Count >= 2)
-        {
-            byte[]? huff = KrakenHuffmanArrayEncoder.TryEncode(
-                System.Runtime.InteropServices.CollectionsMarshal.AsSpan(array));
-            if (huff is not null && huff.Length < raw)
-                return huff.Length;
-        }
-        return raw;
-    }
 
-    // Space-speed lambda used by the array method decision (see HuffmanBeatsRawJ). It weights
-    // the Huffman-array decode-time estimate in the raw-vs-Huffman J-cost. Observed array decisions
-    // pin it to the open interval (0.0321, 0.0662]; 0.046 is the geometric centre, maximising the
-    // classification margin to every observed raw/Huffman decision.
-    private const float ArrayJLambda = 0.046f;
+    /// <summary>
+    /// Space-speed weight in the array method decision. It multiplies the estimated decode time of an
+    /// entropy-coded array, so a larger value biases the decision toward the uncompressed form.
+    /// </summary>
+    private const float ArrayLambda = 0.04f;
 
-    // Raw-vs-Huffman array choice. This is not a raw byte-size compare: the encoder keeps the
-    // Huffman form only when its space-speed J cost is <= the raw form's:
-    //     raw_J  = N + 3                                  (3-byte raw header; no decode-time term)
-    //     huff_J = huffTotalBytes + lambda * decode_time(N)
-    //     keep huff  iff  !(raw_J < huff_J)               (ties resolve to Huffman)
-    // decode_time(N) is the mean of four affine decode-time estimates. Arrays with N < 32 are
-    // always stored raw, which keeps tiny marginal arrays raw.
-    private static bool HuffmanBeatsRawJ(int huffTotalBytes, int n)
+    /// <summary>Fixed cost added to an entropy-coded array's score.</summary>
+    private const float ArrayCompressedBias = 5.0f;
+
+    /// <summary>Header bytes an uncompressed array carries.</summary>
+    private const int RawArrayHeader = 3;
+
+    /// <summary>An array this short or shorter is written uncompressed without building a histogram.</summary>
+    private const int MinEntropyArray = 32;
+
+    /// <summary>
+    /// Estimated decode time of a three-stream entropy array of <paramref name="length"/> bytes over an
+    /// alphabet of <paramref name="nonZeroSymbols"/> symbols in <paramref name="alphabetRuns"/> contiguous
+    /// runs, whose codes average <paramref name="averageBits"/> bits.
+    /// </summary>
+    private static float ArrayDecodeTime(int length, int nonZeroSymbols, int alphabetRuns, float averageBits)
     {
-        if (n < 32) return false;
-        float fn = n;
-        float time = ((0.172f * fn + 284.97f) + (0.282f * fn + 326.121f)
-                    + (0.377f * fn + 388.669f) + (0.161f * fn + 274.27f)) * 0.25f;
-        float huffJ = huffTotalBytes + ArrayJLambda * time;
-        float rawJ = n + 3;
-        return !(rawJ < huffJ);
+        float x = averageBits - 6.0f;
+        float f = x <= 0.0f ? 0.25f : x >= 1.0f ? 0.375f : 0.25f + x * 0.125f;
+        return f * length + 20.0f + nonZeroSymbols * 1.0f + alphabetRuns * 4.0f;
     }
 
     /// <summary>
-    /// Writes <paramref name="array"/> as an entropy (Huffman) array when <paramref name="useHuffman"/>
-    /// is set and the Huffman form wins the space-speed J cost against the raw
-    /// form (see <see cref="HuffmanBeatsRawJ"/>); otherwise writes it raw. The literal/command/length
-    /// streams are read by the decoder via plain <c>DecodeBytes</c>, so a type-2 entropy array is
-    /// transparently accepted in their place.
+    /// The array writer's decision, scored the way the format producer scores it. The incoming
+    /// <paramref name="budget"/> is the score this array has to beat; the uncompressed form scores
+    /// <c>length + 3</c> and caps the budget. The entropy form is accepted only when its estimated score
+    /// is strictly below that capped budget, so an exact tie keeps the incumbent. On acceptance the
+    /// budget is lowered to the entropy form's real score; when the entropy form loses and the incoming
+    /// budget was already no worse than the uncompressed form, the writer declines to write anything.
     /// </summary>
-    private static void WriteArray(List<byte> outBuf, List<byte> array, bool useHuffman)
+    /// <returns>The bytes to write, the length written, and whether anything was written at all.</returns>
+    private static bool PutArray(List<byte> array, bool useHuffman, ref float budget,
+        out byte[]? entropyForm, out int writtenLength)
     {
-        if (useHuffman && array.Count >= 2)
+        entropyForm = null;
+        int n = array.Count;
+        float rawScore = n + RawArrayHeader;
+        float cap = budget < rawScore ? budget : rawScore;
+
+        if (useHuffman && n > MinEntropyArray)
         {
-            byte[]? huff = KrakenHuffmanArrayEncoder.TryEncode(
-                System.Runtime.InteropServices.CollectionsMarshal.AsSpan(array));
-            if (huff is not null && HuffmanBeatsRawJ(huff.Length, array.Count))
+            var source = System.Runtime.InteropServices.CollectionsMarshal.AsSpan(array);
+            var prepared = KrakenHuffmanArrayEncoder.Prepare(source,
+                out KrakenHuffmanArrayEncoder.CostInputs cost);
+            if (prepared is not null && prepared.SingleSymbol)
             {
-                outBuf.AddRange(huff);
-                return;
+                float memsetScore = ArrayLambda * CopyDecodeTime(n) + KrakenHuffmanArrayEncoder.SingleSymbolArrayLength;
+                if (memsetScore < cap)
+                {
+                    budget = memsetScore;
+                    entropyForm = KrakenHuffmanArrayEncoder.Finish(source, prepared);
+                    writtenLength = KrakenHuffmanArrayEncoder.SingleSymbolArrayLength;
+                    return true;
+                }
+                prepared = null;
+            }
+            if (prepared is not null)
+            {
+                float time = ArrayDecodeTime(n, cost.NonZeroSymbols, cost.AlphabetRuns,
+                    (float)cost.CodeLengthBits / n);
+                float overhead = ArrayLambda * time + ArrayCompressedBias;
+                // The gate uses an upper-bound estimate of the coded size, never the final size, so the
+                // symbol streams are only packed once the form has already won.
+                float estimate = ((cost.CodeLengthBits + 7) >> 3) + 13 + cost.HeaderBytes;
+                if (estimate + overhead < cap)
+                {
+                    byte[]? huff = KrakenHuffmanArrayEncoder.Finish(source, prepared);
+                    if (huff is not null)
+                    {
+                        float score = huff.Length + overhead;
+                        if (score < rawScore)
+                        {
+                            budget = score;
+                            entropyForm = huff;
+                            writtenLength = huff.Length;
+                            return true;
+                        }
+                    }
+                }
             }
         }
-        WriteRawArray(outBuf, array);
+
+        if (budget <= rawScore)
+        {
+            writtenLength = 0;
+            return false;
+        }
+        budget = rawScore;
+        writtenLength = n + RawArrayHeader;
+        return true;
+    }
+
+    /// <summary>The byte length the emitter writes for <paramref name="array"/> with an open budget.</summary>
+    private static int EncodedArraySize(List<byte> array, bool useHuffman)
+    {
+        float budget = float.MaxValue;
+        PutArray(array, useHuffman, ref budget, out _, out int length);
+        return length;
+    }
+
+    /// <summary>
+    /// Writes <paramref name="array"/> in whichever form <see cref="PutArray"/> selects: an entropy
+    /// (Huffman) array when it wins the space-speed score against the uncompressed form, otherwise the
+    /// uncompressed form. The literal, command, offset and length streams are all read back through the
+    /// same array reader, so either form is accepted in any of them.
+    /// </summary>
+    private static float WriteArray(List<byte> outBuf, List<byte> array, bool useHuffman)
+    {
+        float budget = float.MaxValue;
+        PutArray(array, useHuffman, ref budget, out byte[]? huff, out _);
+        if (huff is not null)
+            outBuf.AddRange(huff);
+        else
+            WriteRawArray(outBuf, array);
+        return budget;
     }
 
     /// <summary>
@@ -577,6 +862,8 @@ internal static class OodleKrakenEncoder
     private static List<Command> Parse(ReadOnlySpan<byte> data, int[] head, int[] prev,
         int startPos, int litStart0, int matchLimit, int matchStartLimit)
     {
+        // The chain is only read by the value-model selector; the match-table selector ignores it.
+        bool chainUsed = !UseExactGreedy;
         var commands = new List<Command>();
 
         int litStart = litStart0;
@@ -596,7 +883,7 @@ internal static class OodleKrakenEncoder
 
         while (pos <= maxLast)
         {
-            inserted = InsertUpTo(data, head, prev, inserted, pos);
+            if (chainUsed) inserted = InsertUpTo(data, head, prev, inserted, pos);
             Cand cur = UseExactGreedy
                 ? FindMatchExact(data, pos, head, prev, matchLimit, r0, r1, r2, pos - litStart)
                 : FindMatch(data, pos, head, prev, matchLimit, r0, r1, r2);
@@ -609,7 +896,7 @@ internal static class OodleKrakenEncoder
             // 2-step lazy look-ahead: defer the match start while a strictly better match appears.
             while (pos + 1 <= maxLast)
             {
-                inserted = InsertUpTo(data, head, prev, inserted, pos + 1);
+                if (chainUsed) inserted = InsertUpTo(data, head, prev, inserted, pos + 1);
                 Cand m1 = UseExactGreedy
                     ? FindMatchExact(data, pos + 1, head, prev, matchLimit, r0, r1, r2, (pos + 1) - litStart)
                     : FindMatch(data, pos + 1, head, prev, matchLimit, r0, r1, r2);
@@ -621,7 +908,7 @@ internal static class OodleKrakenEncoder
                 }
                 if (pos + 2 > maxLast)
                     break;
-                inserted = InsertUpTo(data, head, prev, inserted, pos + 2);
+                if (chainUsed) inserted = InsertUpTo(data, head, prev, inserted, pos + 2);
                 Cand m2 = UseExactGreedy
                     ? FindMatchExact(data, pos + 2, head, prev, matchLimit, r0, r1, r2, (pos + 2) - litStart)
                     : FindMatch(data, pos + 2, head, prev, matchLimit, r0, r1, r2);
@@ -634,10 +921,17 @@ internal static class OodleKrakenEncoder
                 break;
             }
 
-            commands.Add(new Command(litStart, pos - litStart, cur.Dist, cur.Len, cur.Idx));
-            UpdateRecent(ref r0, ref r1, ref r2, cur.Idx, cur.Dist);
+            // At a chunk's very first parse position every recent offset is still the initial distance,
+            // so a repeat-offset match there decodes the same through slot 0 or slot 1. The greedy
+            // selects slot 1, which changes only the command byte, and that feeds the histogram the
+            // optimal pass is seeded from. The forward DP carries no such rule.
+            int idx = cur.Idx;
+            if (idx == 0 && pos == startPos && r0 == MinDistance && r1 == r0)
+                idx = 1;
+            commands.Add(new Command(litStart, pos - litStart, cur.Dist, cur.Len, idx));
+            UpdateRecent(ref r0, ref r1, ref r2, idx, cur.Dist);
             int end = pos + cur.Len;
-            inserted = InsertUpTo(data, head, prev, inserted, Math.Min(end, maxLast + 1));
+            if (chainUsed) inserted = InsertUpTo(data, head, prev, inserted, Math.Min(end, maxLast + 1));
             pos = end;
             litStart = end;
         }
@@ -761,7 +1055,7 @@ internal static class OodleKrakenEncoder
         // only matchTable[0..3].
         Span<int> cl = stackalloc int[4];
         Span<int> co = stackalloc int[4];
-        int np = FindParetoPairs(data, pos, head, prev, matchLimit, cl, co);
+        int np = FindParetoPairs(data, pos, matchLimit, cl, co);
         int bestNewLen = 0, bestNewOff = 0;
         for (int i = 0; i < np; i++)
         {
@@ -794,77 +1088,32 @@ internal static class OodleKrakenEncoder
     }
 
     /// <summary>
-    /// Reproduces the suffix-trie match output: the per-position Pareto frontier (closest
-    /// offset per achievable length), capped to the 4 longest pairs, length-descending. Walks the full-history
-    /// 4-byte hash chain most-recent-first (distance ascending) and records (len,dist) only when len exceeds
-    /// the running best. This is the same walk <see cref="FindCandidates"/> uses for the DP, minus the
-    /// synthetic off-8 append the greedy selector must not see.
+    /// Returns the new-match candidates at <paramref name="pos"/> from the block match table, in the
+    /// table's own order (length descending, offset descending). Lengths that overrun the chunk's
+    /// match-end limit are capped; candidates that collapse onto the same capped tail end are dropped so
+    /// only the longest-uncapped distance survives, and sub-minimum distances are left for the caller to
+    /// round up.
     /// </summary>
-    private static int FindParetoPairs(ReadOnlySpan<byte> data, int pos, int[] head, int[] prev,
-        int matchLimit, Span<int> outLen, Span<int> outDist)
+    private static int FindParetoPairs(ReadOnlySpan<byte> data, int pos, int matchLimit,
+        Span<int> outLen, Span<int> outDist)
     {
-        int recordMmlEx = GreedyMmlOverride > 0 ? GreedyMmlOverride : MinMatch;
-        // Rolling buffer of the 4 LONGEST Pareto records. The suffix-trie matcher (num_firstbytes=2) records the
-        // closest match of EVERY achievable length; on staircase/periodic data there can be thousands of them, so
-        // a fixed record buffer would truncate to the SHORTEST few. Because Pareto records are length-monotonic
-        // (distance ascending ⇒ length strictly increasing), keeping only the most recent 4 yields the 4 globally
-        // longest — matching find_all_matches num_pairs==4 without an entry cap.
-        Span<int> fl = stackalloc int[4];
-        Span<int> fd = stackalloc int[4];
-        int fn = 0; // entries currently held (0..4), ascending length
-        int bestLen = 0;
-        int distFloor = UseTinyOffsetRemap ? 1 : MinDistance; // include dist 1..7 so the selector can round them up
-        // the suffix-trie matcher (num_firstbytes=2) records the closest match of EVERY achievable length down to
-        // its minimum, and a single such table is shared by all three greedy pre-passes (mml 4/3/8). The
-        // mml=3 pass therefore sees length-3 NEW matches the mml=4/8 passes filter out. Mirror that by
-        // recording down to the pass's effective mml (3 when GreedyMmlOverride==3) rather than the constant
-        // MinMatch. Production (GreedyMmlOverride==0) is unchanged: it still gates at MinMatch (4).
+        int[]? table = MatchTable;
+        if (table is null)
+            return 0;
         int recordMml = GreedyMmlOverride > 0 ? GreedyMmlOverride : MinMatch;
-        int chunkEnd = matchLimit + LiteralTail; // rank by the TRUE (uncapped-to-chunk) length, like the trie
-        uint hs = Hash(data, pos);
-        int c = head[hs];
-        int maxLen = chunkEnd - pos; // the longest match physically possible at this position
-        while (c >= 0)
-        {
-            int dist = pos - c;
-            if (dist >= distFloor)
-            {
-                int len = MatchLength(data, c, pos, chunkEnd);
-                if (len > bestLen)
-                {
-                    bestLen = len;
-                    if (len >= recordMml)
-                    {
-                        if (fn < 4) { fl[fn] = len; fd[fn] = dist; fn++; }
-                        else { fl[0] = fl[1]; fl[1] = fl[2]; fl[2] = fl[3]; fl[3] = len; fd[0] = fd[1]; fd[1] = fd[2]; fd[2] = fd[3]; fd[3] = dist; }
-                    }
-                    // A match reaching the chunk end is the longest possible here; since the walk is
-                    // most-recent-first (closest first), no earlier candidate can be strictly longer. Stop.
-                    // Bounds this greedy match-finder on long-run inputs (otherwise a single hash chain is O(n^2)).
-                    if (bestLen >= maxLen) break;
-                }
-            }
-            c = prev[c];
-        }
-        int keep = fn; // already capped at 4
-        int tailEmit = -1; // capped length shared by tail-overrunning matches (fill longest-uncapped first)
+        int baseIndex = pos * KrakenSuffixTrieMatcher.IntsPerPosition;
+        int tailEmit = -1;
         int outN = 0;
-        for (int i = 0; i < keep; i++)
+        for (int i = 0; i < KrakenSuffixTrieMatcher.PairsPerPosition && outN < outLen.Length; i++)
         {
-            int idx = keep - 1 - i; // ascending buffer → longest first
-            int clen = fl[idx], cdst = fd[idx];
-            // Sub-8 distances are left raw here (FindMatchExact rounds them up itself). Only codeable
-            // distances get the tail cap: a match may extend only to matchLimit (LiteralTail trailing
-            // literals reserved). The trie ranked by FULL length, so a long periodic match that overruns
-            // the tail keeps its farthest, longest-UNCAPPED distance — closer distances that collapse to the
-            // same capped tail end are dropped. This is the greedy analog of FindCandidates' tail collapse
-            // and makes a block-start periodic tail choose d=65536 (period) over d=65528.
-            // Inputs without a tail-overrunning periodic match keep the legacy matchLimit-walk behavior.
+            int clen = table[baseIndex + i * 2];
+            if (clen == 0) break;
+            int cdst = table[baseIndex + i * 2 + 1];
             if (cdst >= MinDistance && clen > matchLimit - pos)
             {
                 clen = matchLimit - pos;
                 if (clen < recordMml) continue;
-                if (clen == tailEmit) continue; // collapsed into an already-emitted longer-uncapped tail
+                if (clen == tailEmit) continue;
                 tailEmit = clen;
             }
             outLen[outN] = clen;
@@ -991,6 +1240,26 @@ internal static class OodleKrakenEncoder
         }
         uint x = (uint)(data[pos] | (data[pos + 1] << 8) | (data[pos + 2] << 16) | (data[pos + 3] << 24));
         return (x * 2654435761u) >> (32 - HashBits);
+    }
+
+    /// <summary>Match length quantized to a four-byte minimum: shorter runs report nothing.</summary>
+    private static int MatchLengthMinimum4(ReadOnlySpan<byte> data, int a, int b, int limit)
+    {
+        if (a < 0) return 0;
+        int len = MatchLength(data, a, b, limit);
+        return len >= 4 ? len : 0;
+    }
+
+    /// <summary>
+    /// Match length quantized to a three-byte minimum: four or more bytes report the full run, exactly
+    /// three report three, anything shorter reports nothing.
+    /// </summary>
+    private static int MatchLengthMinimum3(ReadOnlySpan<byte> data, int a, int b, int limit)
+    {
+        if (a < 0) return 0;
+        int len = MatchLength(data, a, b, limit);
+        if (len >= 4) return len;
+        return len >= 3 ? 3 : 0;
     }
 
     private static int MatchLength(ReadOnlySpan<byte> data, int a, int b, int limit)
@@ -1135,10 +1404,10 @@ internal static class OodleKrakenEncoder
     internal static bool UseLrlExitGate = true;
 
     /// <summary>
-    /// When true, a parse position whose longest relaxed match reaches the optimal-skip length advances directly to that match frontier.
-    /// Default true skips intermediate parse positions inside the long match; disabling it scans every position.
+    /// A parse position whose longest relaxed match reaches the optimal-skip length advances directly to
+    /// that match frontier, skipping the intermediate positions the long match swallows.
     /// </summary>
-    internal static bool UseLongMatchSkip = true;
+    private const bool UseLongMatchSkip = true;
 
     /// <summary>
     /// When true, a windowed re-anchor accepts an equal-cost committed arrival by using <c>&lt;=</c> instead of strict <c>&lt;</c>.
@@ -1242,7 +1511,7 @@ internal static class OodleKrakenEncoder
         int RealEmit(ReadOnlySpan<byte> d, List<Command> cand)
         {
             if (cand.Count == 0) return int.MaxValue;
-            byte[]? b = EmitChunkFromCommands(d, cand, chunkStart, chunkEnd, withSeed, useHuffmanArrays, litMode: 1);
+            byte[]? b = EmitChunkFromCommands(d, cand, chunkStart, chunkEnd, withSeed, useHuffmanArrays, litMode: -1, out _);
             return b?.Length ?? int.MaxValue;
         }
 
@@ -1256,13 +1525,9 @@ internal static class OodleKrakenEncoder
             GreedyMmlOverride = mml; GreedyHashBytesOverride = hashBytes; UseExactGreedy = true; UseTinyOffsetRemap = true;
             try
             {
-                var h = new int[HashSize]; h.AsSpan().Fill(-1);
-                var pv = new int[d.Length]; pv.AsSpan().Fill(-1);
-                // Index the full pre-chunk history [0, startPos) — not just [chunkStart, startPos) — so a
-                // second chunk's parse can back-reference the first chunk (cross-chunk matches), matching the
-                // shared-chain greedy. For a first/single chunk chunkStart==0 so this is unchanged.
-                for (int p = 0; p < startPos; p++) Insert(d, p, h, pv);
-                return Parse(d, h, pv, startPos, litStart0, matchLimit, matchStartLimit);
+                // The selector reads the block's match table, which already covers the whole block, so
+                // this pre-pass carries no chain of its own.
+                return Parse(d, Array.Empty<int>(), Array.Empty<int>(), startPos, litStart0, matchLimit, matchStartLimit);
             }
             finally { GreedyMmlOverride = sMml; GreedyHashBytesOverride = sHb; UseExactGreedy = sEx; UseTinyOffsetRemap = sTiny; }
         }
@@ -1283,13 +1548,15 @@ internal static class OodleKrakenEncoder
         // ONE DP pass seeded from the best greedy's histogram, decayed per 256-entry region
         // (table[i] = (table[i] >> 4) + 1). The DP's cost model is this
         // decayed histogram; its output competes with the best greedy purely on real emit size.
-        var dpHead = new int[HashSize];
-        var dpPrev = new int[data.Length];
+        int[] dpHead = UseSuffixTrieFinder ? Array.Empty<int>() : new int[HashSize];
+        int[] dpPrev = UseSuffixTrieFinder ? Array.Empty<int>() : new int[data.Length];
         int seedLitMode = LitModeForParse(data, bestGreedy, chunkEnd, useHuffmanArrays);
         // Seed passinfo tallies the best greedy with inc=1. The windowed re-tally accumulates
         // with a separate increment (see ForwardDp).
         int[] passinfo = Tally(bestGreedy, data, startPos, 1);
-        DecaySeedPassinfo(passinfo);
+        int[]? carried = CarriedPassinfo;
+        if (carried is null) DecaySeedPassinfo(passinfo);
+        else BlendSeedPassinfo(passinfo, carried, CarriedLitMode == seedLitMode);
         var cc = KrakenOptimalCost.BuildFromPassinfo(passinfo, seedLitMode);
         // When the adaptive windowed parse is enabled, thread the (decayed) seed passinfo + its lit mode into
         // the DP: it re-tallies each committed 256-stride segment onto this cumulative passinfo and rebuilds
@@ -1297,7 +1564,9 @@ internal static class OodleKrakenEncoder
         int[]? adapt = UseWindowedParse ? passinfo : null;
         var dp = ForwardDp(data, dpHead, dpPrev, startPos, matchLimit, matchStartLimit, cc, adapt, seedLitMode);
         int dpEmit = RealEmit(data, dp);
-        if (dpEmit < bestEmit) { best = dp; }
+        // Only the optimal-wins exit carries its end-of-chunk histogram set to the next chunk.
+        PendingCarryPassinfo = null;
+        if (dpEmit < bestEmit) { best = dp; PendingCarryPassinfo = passinfo; }
 
         return best;
     }
@@ -1330,6 +1599,55 @@ internal static class OodleKrakenEncoder
         int tlo = r0 < MinDistance ? MinDistance : r0;
         cost += KrakenOptimalCost.CostLiterals(data, endPos, chunkEnd - endPos, tlo, cc);
         return cost;
+    }
+
+    /// <summary>
+    /// The histogram set the previous chunk of the same block ended with, and the literal model it
+    /// emitted. A chunk after the first seeds its cost model by blending these into its own greedy
+    /// tally instead of decaying that tally alone. Reset for every block; never carried between blocks,
+    /// and never set when the greedy parse beat the optimal one.
+    /// </summary>
+    [ThreadStatic] internal static int[]? CarriedPassinfo;
+
+    /// <summary>The literal model the previous chunk of the block emitted, or -1 when nothing is carried.</summary>
+    [ThreadStatic] internal static int CarriedLitMode;
+
+    /// <summary>Set by the optimal parse when its output won, so the emit path knows to carry its state.</summary>
+    [ThreadStatic] internal static int[]? PendingCarryPassinfo;
+
+    /// <summary>
+    /// Blends the carried histogram set into this chunk's greedy tally. Literal histograms blend only
+    /// when the literal model is unchanged, otherwise they decay on their own. When the offset-table
+    /// count changed the chunk's own offset tallies are replaced by the carried ones and decayed.
+    /// </summary>
+    private static void BlendSeedPassinfo(int[] pi, int[] carried, bool litModeUnchanged)
+    {
+        static void Decay(int[] p, int start)
+        {
+            for (int i = 0; i < 0x100; i++) p[start + i] = (p[start + i] >> 4) + 1;
+        }
+        static void Blend(int[] dst, int[] src, int start)
+        {
+            for (int i = 0; i < 0x100; i++) dst[start + i] = ((dst[start + i] + src[start + i]) >> 5) + 1;
+        }
+
+        if (!litModeUnchanged) { Decay(pi, 0x000); Decay(pi, 0x100); }
+        else { Blend(pi, carried, 0x000); Blend(pi, carried, 0x100); }
+        Blend(pi, carried, 0x200);
+        Blend(pi, carried, 0x300);
+        if (pi[0x400] == carried[0x400])
+        {
+            Blend(pi, carried, 0x401);
+            if (pi[0x400] > 1) Blend(pi, carried, 0x501);
+        }
+        else
+        {
+            Array.Copy(carried, 0x401, pi, 0x401, 0x100);
+            Array.Copy(carried, 0x501, pi, 0x501, 0x100);
+            pi[0x400] = carried[0x400];
+            Decay(pi, 0x401);
+            if (pi[0x400] > 1) Decay(pi, 0x501);
+        }
     }
 
     /// <summary>
@@ -1455,7 +1773,8 @@ internal static class OodleKrakenEncoder
             // DP can find matches that reference the 8-byte COPY_64 seed (e.g. a match that backward-extends
             // into the seed). EncodeChunk indexes these into the shared greedy chain; the DP's private chain
             // must mirror that or it underfinds the very first backward-extended match.
-            dpHead.AsSpan().Fill(-1);
+            bool chainUsed = !UseSuffixTrieFinder;
+            if (chainUsed) dpHead.AsSpan().Fill(-1);
             // Index the full pre-chunk history [0, startPos): for a first/single chunk this is the seed
             // region [0,8); for a second chunk it is the entire first chunk, so the DP finds cross-chunk
             // back-matches (the private chain must mirror the shared greedy chain, or chunk1 underfinds).
@@ -1472,7 +1791,7 @@ internal static class OodleKrakenEncoder
                 ctmfBits = cl < 18 ? 18 : cl;
             }
             if (CtmfBitsOverride > 0) ctmfBits = CtmfBitsOverride;
-            Ctmf? ctmf = UseCtmfFinder ? new Ctmf(ctmfBits, data.Length) : null;
+            Ctmf? ctmf = UseCtmfFinder && !UseSuffixTrieFinder ? new Ctmf(ctmfBits, data.Length) : null;
             int ctmfIns = inserted;
 
             Span<int> cml = stackalloc int[8];
@@ -1494,6 +1813,7 @@ internal static class OodleKrakenEncoder
 
             int anchor = startPos;
             long accLit = 0;
+            int prevReach = startPos;
 
             while (true)
             {
@@ -1513,9 +1833,13 @@ internal static class OodleKrakenEncoder
                     if (end - NoMatchZone <= windowEnd) windowEnd = end;
                     // Reset stale forward arrivals left by the PREVIOUS window's lookahead: they were relaxed
                     // under the previous window's codecost and must be recomputed under the new (rebuilt) one.
-                    // arr[segStart] (the committed boundary cost) is preserved.
+                    // arr[segStart] (the committed boundary cost) is preserved. Only the range the previous
+                    // window actually reached can hold a stale arrival, so the clear stops there.
                     if (segStart > startPos)
-                        for (int i = segStart + 1; i <= maxArr; i++) arr[i].Cost = int.MaxValue;
+                    {
+                        int clearEnd = prevReach < maxArr ? prevReach : maxArr;
+                        for (int i = segStart + 1; i <= clearEnd; i++) arr[i].Cost = int.MaxValue;
+                    }
                 }
                 int commitEnd = -1; // -1 ⇒ the pos loop ran to matchStartLimit ⇒ final segment
 
@@ -1543,7 +1867,7 @@ internal static class OodleKrakenEncoder
                         }
                     }
 
-                    inserted = InsertUpTo(data, dpHead, dpPrev, inserted, pos);
+                    if (chainUsed) inserted = InsertUpTo(data, dpHead, dpPrev, inserted, pos);
                     if (ctmf != null)
                         while (ctmfIns < inserted) { ctmf.Insert(data, ctmfIns); ctmfIns++; }
                     int nc = FindCandidates(data, pos, dpHead, dpPrev, matchLimit, cc, cml, cdist, coff, ctmf);
@@ -1559,7 +1883,10 @@ internal static class OodleKrakenEncoder
                         int run = lrl;
                         if (lrl == 3 && 3 < pos - anchor) run = pos - anchor; // 4th iteration = full run from anchor
                         int src = pos - run;
-                        if (src < startPos) continue;
+                        // An arrival's literal run may not start before the segment origin: everything
+                        // before it is already committed and the backward trace has to end exactly there.
+                        // The run only grows across the iteration sequence, so no later source qualifies.
+                        if (src < segStart) break;
                         if (arr[src].Cost == int.MaxValue) continue;
 
                         int slo = arr[src].R0 < MinDistance ? MinDistance : arr[src].R0;
@@ -1703,6 +2030,8 @@ internal static class OodleKrakenEncoder
                     return outCmds!;
                 }
 
+                prevReach = DpMaxReached + SublenFillThreshold;
+                if (prevReach > maxArr) prevReach = maxArr;
                 var seg = BackTraceSeg(arr, segStart, commitEnd, maxArr);
                 if (seg == null) return outCmds!; // trace failed → return the committed prefix (ParseOptimal reselects)
                 outCmds!.AddRange(seg);
@@ -1711,6 +2040,7 @@ internal static class OodleKrakenEncoder
                 int[] tal = TallyRecents(seg, data, segStart, 2, -1, ref tr0, ref tr1, ref tr2);
                 int nAdapt = adaptPassinfo!.Length < tal.Length ? adaptPassinfo.Length : tal.Length;
                 for (int i = 0; i < nAdapt; i++) adaptPassinfo[i] += tal[i];
+                cc = KrakenOptimalCost.BuildFromPassinfo(adaptPassinfo, adaptLitMode);
                 segStart = commitEnd;
                 if (segStart >= end)
                 {
@@ -1860,86 +2190,49 @@ internal static class OodleKrakenEncoder
         Ctmf? ctmf)
     {
         int n = 0;
-        int chunkEnd = matchLimit + LiteralTail;
         if (UseSuffixTrieFinder)
         {
-            // Full-history Pareto finder = output-equivalent to the suffix-trie matcher.
-            // Walk the whole hash chain (most-recent-first ⇒ distance ascending). A
-            // candidate is on the Pareto frontier iff it is strictly longer than every CLOSER candidate, so
-            // recording (len,dist) only when len exceeds the running best yields the closest offset for each
-            // achievable length. Keep the 4 LONGEST pairs (find_all_matches num_pairs==4), ml-descending.
-            // The buffer holds only the most recent 4 records; since records are length-monotonic those ARE the
-            // 4 longest, so staircase/periodic inputs (thousands of achievable lengths) are handled without a cap.
-            Span<int> fl = stackalloc int[4];
-            Span<int> fd = stackalloc int[4];
-            int fn = 0;
-            int bestLen = 0;
-            int recMin = UseDpMml3 ? DpMml3 : MinMatch; // lvl7 suffix-trie match finder mml (3 vs 4)
-            int distFloor = UseTinyOffsetRemap ? 1 : MinDistance; // include dist 1..7 for the round-up below
-            uint hs = Hash(data, pos);
-            int c = dpHead[hs];
-            int maxLen = chunkEnd - pos; // the longest match physically possible at this position
-            while (c >= 0)
+            int[]? table = MatchTable;
+            if (table is null) return 0;
+            int recMin = UseDpMml3 ? DpMml3 : MinMatch;
+            int baseIndex = pos * KrakenSuffixTrieMatcher.IntsPerPosition;
+            int tailEmit = -1;
+            for (int i = 0; i < KrakenSuffixTrieMatcher.PairsPerPosition; i++)
             {
-                int dist = pos - c;
-                if (dist >= distFloor)
+                int clen = table[baseIndex + i * 2];
+                if (clen == 0) break;
+                int cdst = table[baseIndex + i * 2 + 1];
+                if (cdst < MinDistance)
                 {
-                    int len = MatchLength(data, c, pos, chunkEnd);
-                    if (len > bestLen)
-                    {
-                        bestLen = len;
-                        if (len >= recMin)
-                        {
-                            if (fn < 4) { fl[fn] = len; fd[fn] = dist; fn++; }
-                            else { fl[0] = fl[1]; fl[1] = fl[2]; fl[2] = fl[3]; fl[3] = len; fd[0] = fd[1]; fd[1] = fd[2]; fd[2] = fd[3]; fd[3] = dist; }
-                        }
-                        // A match that reaches the chunk end is the longest possible here; since the walk is
-                        // most-recent-first (closest offset first), no earlier (farther) candidate can be
-                        // strictly longer, so nothing more would be recorded. Stop. This leaves the finder's
-                        // output identical while bounding the walk on long-run inputs (e.g. the zero-padded
-                        // metadata region), which otherwise makes a single hash chain O(n^2).
-                        if (bestLen >= maxLen) break;
-                    }
-                }
-                c = dpPrev[c];
-            }
-            int keep = fn; // already capped at 4
-            int tailEmit = -1; // capped length shared by tail-overrunning matches (fill longest-first)
-            for (int i = 0; i < keep; i++)
-            {
-                int idx = keep - 1 - i; // ascending buffer → longest first
-                int clen = fl[idx], cdst = fd[idx];
-                if (UseTinyOffsetRemap && cdst < MinDistance)
-                {
-                    // The DP rounds a sub-8 distance up and recomputes its length too.
+                    // A distance below the minimum is rounded up to the nearest codeable one that keeps
+                    // the period, and the length is recomputed there; a candidate that no longer reaches
+                    // the minimum match length is dropped.
                     int rounded = RoundUpTiny(cdst);
                     if (rounded == 0 || rounded > pos) continue;
-                    int rlen = MatchLength(data, pos - rounded, pos, matchLimit);
+                    int rlen = MatchLengthMinimum4(data, pos - rounded, pos, matchLimit);
                     if (rlen < recMin) continue;
                     clen = rlen;
                     cdst = rounded;
                 }
                 else if (clen > matchLimit - pos)
                 {
-                    // Tail cap: the trie ranked this match by its full length, but a match may only extend to
-                    // matchLimit (LiteralTail trailing literals reserved). Cap the emitted length yet keep the
-                    // farther distance. The optimal-parse match fill runs longest-first and fills lengths down
-                    // to the previous candidate's capped length, so shorter-uncapped matches that collapse to
-                    // the same tail end are not emitted; only this longest-uncapped distance survives.
+                    // The table ranks by the untruncated length; a match may only extend to the chunk's
+                    // match-end limit, so cap it here and keep the farther distance.
                     clen = matchLimit - pos;
                 }
                 if (clen < recMin) continue;
-                if (clen == tailEmit) continue; // collapsed into an already-emitted longer-uncapped tail match
+                if (clen == tailEmit) continue;
                 if (pos + clen >= matchLimit) tailEmit = clen;
                 n = InsertCandidate(cml, cdist, n, clen, cdst, 4);
             }
-            int off8s = RepMatchLength(data, pos, MinDistance, matchLimit);
-            if (off8s >= MinMatch)
-                n = InsertCandidate(cml, cdist, n, off8s, MinDistance, cml.Length);
+            int forced = MatchLengthMinimum3(data, pos - MinDistance, pos, matchLimit);
+            if (pos >= MinDistance && forced >= recMin)
+                n = InsertCandidate(cml, cdist, n, forced, MinDistance, cml.Length);
             for (int i = 0; i < n; i++)
                 coff[i] = KrakenOptimalCost.CostOffset(cdist[i], cc);
             return n;
         }
+        int chunkEnd = matchLimit + LiteralTail;
         int bestCtmfLen = 0;
         if (ctmf != null)
         {

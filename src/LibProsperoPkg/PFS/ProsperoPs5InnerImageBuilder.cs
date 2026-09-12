@@ -46,8 +46,8 @@ public sealed class ProsperoPs5InnerImageBuilder
     private static int AlignUp(int v, int a) => (v + a - 1) & ~(a - 1);
 
     /// <summary>
-    /// Kraken-compresses a payload into its concatenated on-disk bytes (256 KiB blocks). Returns the raw bytes
-    /// when compression does not save at least 6.25%, or when <paramref name="storeRaw"/>.
+    /// Compresses a payload into its concatenated on-disk bytes (256 KiB blocks), or returns the caller's
+    /// own array unchanged when <paramref name="storeRaw"/> is set.
     /// </summary>
     public static byte[] CompressPayload(byte[] raw, bool storeRaw)
         => CompressPayload(raw, storeRaw, out _);
@@ -71,12 +71,10 @@ public sealed class ProsperoPs5InnerImageBuilder
             ms.Write(d, 0, d.Length);
         }
         byte[] comp = ms.ToArray();
-        if (comp.Length <= (int)(((long)raw.Length * 15) >> 4))
-        {
-            compressedFile = pf;
-            return comp;
-        }
-        return raw;
+        // Each block has already made its own store decision, so the compressed form never exceeds the
+        // raw form and there is no file-level threshold on top of it.
+        compressedFile = pf;
+        return comp;
     }
 
     /// <summary>

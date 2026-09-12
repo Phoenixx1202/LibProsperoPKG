@@ -66,6 +66,9 @@ internal sealed class ProsperoFihNwonlyFields
 
     /// <summary>FIH 0xF0: app-payload (non-sce_sys) regular file count.</summary>
     public int AppFileCount { get; init; }
+
+    /// <summary>Inner PFS total block count (Ndblock) for the logical mount size at FIH 0xA0.</summary>
+    public long Ndblock { get; init; }
 }
 
 /// <summary>The PS5 volume kind, which selects the content-type code stamped into the header.</summary>
@@ -273,6 +276,7 @@ public static class ProsperoPkgBuilder
                 ContentVersionHi = ContentVersionHigh(ReadParamJsonInfo(sourceFolder).ContentVersion),
                 InnerContentInodes = innerContentInodes,
                 AppFileCount = appFileCount,
+                Ndblock = asmResult.Ndblock,
             };
 
             log("Preparing PS5 outer PFS (encrypted + signed)...");
@@ -792,7 +796,8 @@ public static class ProsperoPkgBuilder
             nestedMetaBaseBlocks: nestedMetaBaseBlocks,
             nwonlyContentVersionHi: nwonlyFih?.ContentVersionHi ?? 0,
             nwonlyInnerContentInodes: nwonlyFih?.InnerContentInodes ?? 0,
-            nwonlyAppFileCount: nwonlyFih?.AppFileCount ?? 0);
+            nwonlyAppFileCount: nwonlyFih?.AppFileCount ?? 0,
+            nwonlyNdblock: nwonlyFih?.Ndblock ?? 0);
         pkg.Header.pfs_signed_digest = ProsperoImageDigests.ComputeFixedInfoDigest(fihBlock);
 
         // General digests (PS5 nwonly scheme: type 0x102 [set at creation so the layout reserves 0x1E0],

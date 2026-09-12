@@ -59,6 +59,60 @@ public static class ProsperoCompressedPfsImage
     private const uint PfscMagic = 0x43534650; // 'P','F','S','C'
 
     /// <summary>
+    /// Streams a prepared inner image into a PS5 Kraken PFSv3 container. The output is byte for byte
+    /// what <see cref="Pack(ReadOnlySpan{byte}, int, int)"/> produces, and neither the image nor the
+    /// container is held in memory.
+    /// </summary>
+    /// <param name="destination">Seekable, writable. The container is written at its current position.</param>
+    /// <param name="source">Readable; read once, front to back.</param>
+    /// <param name="sourceLength">The logical length to read from <paramref name="source"/>.</param>
+    /// <param name="level">The Kraken level recorded in the header. Default 7.</param>
+    /// <param name="blockSize">The logical block size. Default 256 KiB. Must be positive.</param>
+    public static void PackTo(Stream destination, Stream source, long sourceLength,
+        int level = DefaultLevel, int blockSize = DefaultBlockSize)
+        => ProsperoCompressedPfsFileWriter.WriteCompressed(destination, source, sourceLength, level, blockSize);
+
+    /// <summary>
+    /// Reads a container's block tables and counts how many blocks were kept compressed, without
+    /// reading the block payloads.
+    /// </summary>
+    private static (int BlockSize, int BlockCount, int CompressedBlocks) ReadBlockStatistics(string containerPath)
+    {
+        using var stream = new FileStream(containerPath, FileMode.Open, FileAccess.Read, FileShare.Read);
+        Span<byte> header = stackalloc byte[0x48 + 7 * 16];
+        stream.ReadExactly(header);
+        int blockSize = checked((int)BinaryPrimitives.ReadUInt32LittleEndian(header[0x08..]));
+        int sectionCount = BinaryPrimitives.ReadUInt16LittleEndian(header[0x06..]);
+        long boundaryOffset = 0, boundarySize = 0;
+        for (int i = 0; i < sectionCount; i++)
+        {
+            int p = 0x48 + i * 16;
+            if (BinaryPrimitives.ReadUInt16LittleEndian(header[p..]) != 3) continue;
+            boundaryOffset = BinaryPrimitives.ReadUInt32LittleEndian(header[(p + 2)..])
+                             | ((long)BinaryPrimitives.ReadUInt16LittleEndian(header[(p + 6)..]) << 32);
+            boundarySize = BinaryPrimitives.ReadUInt32LittleEndian(header[(p + 10)..])
+                           | ((long)BinaryPrimitives.ReadUInt16LittleEndian(header[(p + 14)..]) << 32);
+        }
+        if (boundarySize < 2 * 16) return (blockSize, 0, 0);
+        int blockCount = checked((int)(boundarySize / 16)) - 1;
+        var table = new byte[checked((int)boundarySize)];
+        stream.Seek(boundaryOffset, SeekOrigin.Begin);
+        stream.ReadExactly(table);
+        int compressed = 0;
+        for (int i = 0; i < blockCount; i++)
+        {
+            ulong e0 = BinaryPrimitives.ReadUInt64LittleEndian(table.AsSpan(i * 16));
+            ulong e1 = BinaryPrimitives.ReadUInt64LittleEndian(table.AsSpan(i * 16 + 8));
+            ulong e0n = BinaryPrimitives.ReadUInt64LittleEndian(table.AsSpan((i + 1) * 16));
+            ulong e1n = BinaryPrimitives.ReadUInt64LittleEndian(table.AsSpan((i + 1) * 16 + 8));
+            long comp = (long)((e0n & 0xFFFFFFFFFFFuL) - (e0 & 0xFFFFFFFFFFFuL));
+            long uncomp = (long)((e1n & 0xFFFFFFFFFFFuL) - (e1 & 0xFFFFFFFFFFFuL));
+            if (comp != uncomp) compressed++;
+        }
+        return (blockSize, blockCount, compressed);
+    }
+
+    /// <summary>
     /// Compresses an already-prepared inner image into a PS5 Kraken PFSv3 container in memory. Each
     /// block is Kraken-compressed; blocks that do not shrink are stored uncompressed.
     /// </summary>
@@ -105,40 +159,36 @@ public static class ProsperoCompressedPfsImage
 
         var log = logger ?? (_ => { });
         long length = new FileInfo(inputImagePath).Length;
-        if (length > Array.MaxLength)
-            throw new NotSupportedException(
-                $"The inner image is {length:N0} bytes; the in-memory Kraken packer supports up to {Array.MaxLength:N0} bytes.");
 
         var dir = Path.GetDirectoryName(Path.GetFullPath(outputPath));
         if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
 
         log($"Packing {Path.GetFileName(inputImagePath)} ({length:N0} bytes) into a PS5 Kraken PFSv3 image...");
 
-        byte[] raw = File.ReadAllBytes(inputImagePath);
-        byte[] container = Pack(raw, level, blockSize);
-        File.WriteAllBytes(outputPath, container);
+        // Streamed, so an image of any size the format allows can be packed without holding either the
+        // image or the container in memory.
+        using (var source = new FileStream(inputImagePath, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 20))
+        using (var destination = new FileStream(outputPath, FileMode.Create, FileAccess.Write, FileShare.None, 1 << 20))
+        {
+            ProsperoCompressedPfsFileWriter.WriteCompressed(destination, source, length, level, blockSize);
+        }
 
-        // Parse the produced container to report accurate block statistics.
-        var parsed = ProsperoCompressedPfsFile.Parse(container);
-        int compressed = 0;
-        foreach (var block in parsed.Blocks)
-            if (!block.IsStored) compressed++;
-        int blockCount = parsed.Blocks.Count;
+        var stats = ReadBlockStatistics(outputPath);
 
         var result = new ProsperoCompressedPfsImageResult
         {
             OutputPath = outputPath,
             RawSize = length,
-            EncodedSize = container.Length,
-            BlockSize = parsed.BlockSize,
-            BlockCount = blockCount,
-            CompressedBlocks = compressed,
+            EncodedSize = new FileInfo(outputPath).Length,
+            BlockSize = stats.BlockSize,
+            BlockCount = stats.BlockCount,
+            CompressedBlocks = stats.CompressedBlocks,
         };
 
         if (result.StoredRaw)
             log("Compression produced no benefit; every block was stored uncompressed.");
         else
-            log($"Done: {result.EncodedSize:N0} bytes ({result.GainPercent:F1}% saved, {compressed}/{blockCount} blocks compressed).");
+            log($"Done: {result.EncodedSize:N0} bytes ({result.GainPercent:F1}% saved, {result.CompressedBlocks}/{result.BlockCount} blocks compressed).");
 
         return result;
     }

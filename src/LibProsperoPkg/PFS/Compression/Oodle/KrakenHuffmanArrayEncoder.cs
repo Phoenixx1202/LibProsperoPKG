@@ -31,12 +31,93 @@ internal static class KrakenHuffmanArrayEncoder
 {
     private const int MaxCodeLen = 11;
 
+    /// <summary>Largest payload the five-byte compressed array header can describe.</summary>
+    private const int MaxArrayPayload = 0x3FFFF;
+
+    /// <summary>
+    /// The inputs the array-selection cost model needs about a Huffman candidate: the total code-length
+    /// bits over the array, the number of symbols with a nonzero count, the number of contiguous runs of
+    /// such symbols in the code-length table, and the size of the code-length transmission header.
+    /// </summary>
+    internal readonly struct CostInputs
+    {
+        public readonly long CodeLengthBits;
+        public readonly int NonZeroSymbols;
+        public readonly int AlphabetRuns;
+        public readonly int HeaderBytes;
+
+        public CostInputs(long codeLengthBits, int nonZeroSymbols, int alphabetRuns, int headerBytes)
+        {
+            CodeLengthBits = codeLengthBits;
+            NonZeroSymbols = nonZeroSymbols;
+            AlphabetRuns = alphabetRuns;
+            HeaderBytes = headerBytes;
+        }
+    }
+
+    /// <summary>
+    /// A code assignment for one array: everything needed to score the entropy form, and everything
+    /// needed to emit it afterwards. Building this is much cheaper than packing the streams, so a caller
+    /// that may reject the form should prepare it, score it, and only then finish it.
+    /// </summary>
+    internal sealed class Prepared
+    {
+        internal CostInputs Cost;
+        internal byte[] LengthOfSymbol = Array.Empty<byte>();
+        internal ushort[] ReversedCode = Array.Empty<ushort>();
+        internal byte[] Header = Array.Empty<byte>();
+
+        /// <summary>True when every byte is the same symbol, which has its own eight-byte form.</summary>
+        internal bool SingleSymbol;
+
+        /// <summary>The only symbol present, when <see cref="SingleSymbol"/> is set.</summary>
+        internal byte Symbol;
+    }
+
+    /// <summary>
+    /// The eight-byte array a run of one repeated symbol takes: a five-byte header declaring a
+    /// three-byte payload, and a payload that is nothing but the code-length transmission for a
+    /// one-symbol alphabet. No symbol stream follows it.
+    /// </summary>
+    internal static byte[] BuildSingleSymbolArray(byte symbol, int length)
+    {
+        byte[] array = BuildEntropyArray(chunkType: 2, srcSize: SingleSymbolPayload, dstSize: length, out int bodyOff);
+        array[bodyOff] = 0x00;
+        array[bodyOff + 1] = (byte)((symbol >> 2) | 0x40);
+        array[bodyOff + 2] = (byte)(symbol << 6);
+        return array;
+    }
+
+    /// <summary>Payload bytes the one-symbol form carries.</summary>
+    private const int SingleSymbolPayload = 3;
+
+    /// <summary>Total bytes the one-symbol form occupies.</summary>
+    internal const int SingleSymbolArrayLength = 5 + SingleSymbolPayload;
+
     /// <summary>
     /// Attempts to Huffman-encode <paramref name="data"/> as a single entropy array. Returns the
-    /// on-disk array bytes (header + payload) or <c>null</c> if not beneficial / not representable.
+    /// on-disk array bytes (header + payload) or <c>null</c> if not representable.
     /// </summary>
-    public static byte[]? TryEncode(ReadOnlySpan<byte> data)
+    public static byte[]? TryEncode(ReadOnlySpan<byte> data) => TryEncode(data, out _);
+
+    /// <summary>
+    /// As <see cref="TryEncode(ReadOnlySpan{byte})"/>, and also reports the cost-model inputs the
+    /// caller needs to decide between this form and the uncompressed one.
+    /// </summary>
+    public static byte[]? TryEncode(ReadOnlySpan<byte> data, out CostInputs cost)
     {
+        Prepared? prepared = Prepare(data, out cost);
+        return prepared is null ? null : Finish(data, prepared);
+    }
+
+    /// <summary>
+    /// Builds the code assignment and the code-length header for <paramref name="data"/> and reports the
+    /// cost-model inputs, without packing the symbol streams. Returns null when the array is not
+    /// representable in this form.
+    /// </summary>
+    internal static Prepared? Prepare(ReadOnlySpan<byte> data, out CostInputs cost)
+    {
+        cost = default;
         int d = data.Length;
         if (d < 2 || d > 0x3FFFF) return null;
 
@@ -48,16 +129,11 @@ internal static class KrakenHuffmanArrayEncoder
 
         if (distinct == 1)
         {
-            // A single-symbol top-level array is rejected by the decoder: Type12 returns a negative
-            // consumed length for numSyms==1, which the DecodeBytes caller's "src_used != src_size"
-            // check treats as failure. Single-symbol RLE only exists nested inside MultiArray/recursive
-            // contexts. Synthesize a phantom second symbol (freq 1, never present in the body) and use
-            // the validated 2-symbol path instead. Both symbols get length 1; the body emits only the real one.
-            int realSym = 0;
-            for (int s = 0; s < 256; s++) if (freq[s] != 0) { realSym = s; break; }
-            int phantom = realSym == 0 ? 1 : 0;
-            freq[phantom] = 1;
-            distinct = 2;
+            // One repeated symbol has its own eight-byte form, whose whole payload is the code-length
+            // transmission. The score model treats it separately, so no cost inputs are reported.
+            int only = 0;
+            for (int s = 0; s < 256; s++) if (freq[s] != 0) { only = s; break; }
+            return new Prepared { SingleSymbol = true, Symbol = (byte)only };
         }
 
         // Code lengths (length-limited to 11, complete prefix code).
@@ -88,6 +164,37 @@ internal static class KrakenHuffmanArrayEncoder
             : BuildComplexCodeLengthHeader(lenOfSym);
         if (headerBytes is null) return null;
 
+        long codeLengthBits = 0;
+        int nonZero = 0, runs = 0;
+        bool inRun = false;
+        for (int s = 0; s < 256; s++)
+        {
+            if (lenOfSym[s] == 0) { inRun = false; continue; }
+            nonZero++;
+            if (!inRun) { runs++; inRun = true; }
+            codeLengthBits += (long)freq[s] * lenOfSym[s];
+        }
+        cost = new CostInputs(codeLengthBits, nonZero, runs, headerBytes.Length);
+        return new Prepared
+        {
+            Cost = cost,
+            LengthOfSymbol = lenOfSym,
+            ReversedCode = revOfSym,
+            Header = headerBytes,
+        };
+    }
+
+    /// <summary>Packs the symbol streams and returns the finished array, or null when it cannot be framed.</summary>
+    internal static byte[]? Finish(ReadOnlySpan<byte> data, Prepared prepared)
+    {
+        if (prepared.SingleSymbol)
+            return BuildSingleSymbolArray(prepared.Symbol, data.Length);
+
+        int d = data.Length;
+        byte[] lenOfSym = prepared.LengthOfSymbol;
+        ushort[] revOfSym = prepared.ReversedCode;
+        byte[] headerBytes = prepared.Header;
+
         // 2) Three interleaved symbol streams (output positions mod 3): A=0,3,..; B=1,4,..; C=2,5,..
         var aw = new LsbBitWriter();
         var bw = new LsbBitWriter();
@@ -113,7 +220,7 @@ internal static class KrakenHuffmanArrayEncoder
 
         // 3) Assemble payload = [2B splitMid=lenA][A][C][reverse(B)].
         int payloadLen = headerBytes.Length + 2 + lenA + cBytes.Length + bBytes.Length;
-        if (payloadLen >= d) return null; // not beneficial; caller stores raw.
+        if (payloadLen > MaxArrayPayload) return null;
 
         byte[] arr = BuildEntropyArray(chunkType: 2, srcSize: payloadLen, dstSize: d, out int bodyOff);
         int p = bodyOff;

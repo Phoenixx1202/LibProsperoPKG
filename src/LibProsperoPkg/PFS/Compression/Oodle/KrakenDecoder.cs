@@ -53,10 +53,16 @@ internal static class KrakenDecoder
     // 128 KiB sub-chunks whose types are INDEPENDENT (newLZ or bare-entropy), so each is decoded on its
     // own per these bits. These bits cover newLZ, entropy, and mixed inputs and align with the
     // frame rebuilder's bit-38 newLZ flag.
+    // The flag byte is two independent 4-bit groups, one per sub-chunk: bit 0 literal model,
+    // bit 1 LZ enable, bit 2 restart (decode at output position 0), bit 3 verbatim copy — and
+    // bits 4..7 the same four for sub-chunk 1. Sub-chunk 0 always decodes at position 0, so its
+    // restart bit carries no extra information; the verbatim-copy bits agree with the authoritative
+    // size test (compressed length == uncompressed length) and are not read.
     private const int Chunk0SubLitBit = 0x01; // chunk0 literal model: set = sub/delta (mode 0), clear = raw (mode 1)
     private const int Chunk0NewLzBit = 0x02;  // chunk0 is newLZ; clear = bare-entropy array
     private const int Chunk1SubLitBit = 0x10; // chunk1 literal model (same encoding as chunk0)
-    private const int Chunk1NewLzBit = 0x20;  // chunk1 is newLZ; clear (with 0x40) = bare-entropy array
+    private const int Chunk1NewLzBit = 0x20;  // chunk1 is newLZ; clear = bare-entropy array
+    private const int Chunk1RestartBit = 0x40; // chunk1 decodes at output position 0 instead of ChunkMax
 
     /// <summary>
     /// Decodes a whole PFS block (the section-7 payload) into <paramref name="dst"/> (sized to the
@@ -78,44 +84,64 @@ internal static class KrakenDecoder
         byte[] src = payload.ToArray();
         byte[] outBuf = new byte[dst.Length];
 
-        bool chunk0NewLz = (flags & Chunk0NewLzBit) != 0;
-        int litMode0 = (flags & Chunk0SubLitBit) != 0 ? 0 : 1;
-        bool multiChunk = dst.Length > ChunkMax;
+        // Sub-chunk geometry. The size hint carries sub-chunk 0's compressed length for every block,
+        // so both sub-chunks are located the same way whether or not the block is split.
+        int chunk0Dst = dst.Length < ChunkMax ? dst.Length : ChunkMax;
+        int chunk1Dst = dst.Length - chunk0Dst;
+        int chunk0Comp = chunk1Dst == 0 ? src.Length : firstChunkComp;
+        if (chunk0Comp <= 0 || chunk0Comp > src.Length)
+            return KrakenDecodeStatus.Malformed;
+        int chunk1Comp = src.Length - chunk0Comp;
+        if (chunk1Dst == 0 && chunk1Comp != 0)
+            return KrakenDecodeStatus.Malformed;
 
-        KrakenDecodeStatus st;
-        if (!multiChunk)
+        KrakenDecodeStatus st = DecodeSubChunk(
+            src, 0, chunk0Comp, outBuf, 0, chunk0Dst,
+            lzEnable: (flags & Chunk0NewLzBit) != 0,
+            restart: true,
+            literalMode: (flags & Chunk0SubLitBit) != 0 ? 0 : 1);
+        if (st != KrakenDecodeStatus.Success)
+            return st;
+
+        if (chunk1Dst > 0)
         {
-            st = chunk0NewLz
-                ? DecodeChunk(src, 0, src.Length, outBuf, 0, dst.Length, withSeed: true, litMode0)
-                : DecodeBareEntropyBlock(src, 0, src.Length, outBuf, 0, dst.Length);
-        }
-        else
-        {
-            if (firstChunkComp <= 0 || firstChunkComp > src.Length || dst.Length <= ChunkMax)
-                return KrakenDecodeStatus.Malformed;
-
-            bool chunk1NewLz = (flags & Chunk1NewLzBit) != 0;
-            int litMode1 = (flags & Chunk1SubLitBit) != 0 ? 0 : 1;
-            int chunk1Comp = src.Length - firstChunkComp;
-            int chunk1Dst = dst.Length - ChunkMax;
-
-            // Sub-chunk 0 -> [0:ChunkMax].
-            st = chunk0NewLz
-                ? DecodeChunk(src, 0, firstChunkComp, outBuf, 0, ChunkMax, withSeed: true, litMode0)
-                : DecodeBareEntropyBlock(src, 0, firstChunkComp, outBuf, 0, ChunkMax);
+            // Sub-chunk 1 normally continues the same output window, so a newLZ sub-chunk 1 may
+            // back-reference sub-chunk 0's bytes; the restart bit instead makes it decode as its own
+            // window at position 0, with its own seed and no back-references.
+            st = DecodeSubChunk(
+                src, chunk0Comp, chunk1Comp, outBuf, chunk0Dst, chunk1Dst,
+                lzEnable: (flags & Chunk1NewLzBit) != 0,
+                restart: (flags & Chunk1RestartBit) != 0,
+                literalMode: (flags & Chunk1SubLitBit) != 0 ? 0 : 1);
             if (st != KrakenDecodeStatus.Success)
                 return st;
-
-            // Sub-chunk 1 -> [ChunkMax:end], seedless; a newLZ chunk1 may back-reference chunk0's bytes
-            // regardless of how chunk0 was decoded (they share the destination buffer).
-            st = chunk1NewLz
-                ? DecodeChunk(src, firstChunkComp, chunk1Comp, outBuf, ChunkMax, chunk1Dst, withSeed: false, litMode1)
-                : DecodeBareEntropyBlock(src, firstChunkComp, chunk1Comp, outBuf, ChunkMax, chunk1Dst);
         }
 
-        if (st == KrakenDecodeStatus.Success)
-            outBuf.AsSpan(0, dst.Length).CopyTo(dst);
+        outBuf.AsSpan(0, dst.Length).CopyTo(dst);
         return st;
+    }
+
+    /// <summary>
+    /// Decodes one sub-chunk into <paramref name="outBuf"/> at <paramref name="dstStart"/>. A sub-chunk
+    /// whose compressed length equals its uncompressed length is a verbatim copy; otherwise it is a
+    /// newLZ sub-chunk when <paramref name="lzEnable"/> is set and a single entropy array when it is not.
+    /// <paramref name="restart"/> selects a fresh output window (own seed, no back-references) instead of
+    /// continuing the block's window.
+    /// </summary>
+    private static KrakenDecodeStatus DecodeSubChunk(
+        byte[] src, int srcStart, int srcLen, byte[] outBuf, int dstStart, int dstLen,
+        bool lzEnable, bool restart, int literalMode)
+    {
+        if (srcLen < 0 || srcStart + srcLen > src.Length || dstLen < 0 || dstStart + dstLen > outBuf.Length)
+            return KrakenDecodeStatus.Malformed;
+        if (srcLen == dstLen)
+        {
+            Array.Copy(src, srcStart, outBuf, dstStart, dstLen);
+            return KrakenDecodeStatus.Success;
+        }
+        return lzEnable
+            ? DecodeChunk(src, srcStart, srcLen, outBuf, dstStart, dstLen, withSeed: restart, literalMode)
+            : DecodeBareEntropyBlock(src, srcStart, srcLen, outBuf, dstStart, dstLen);
     }
 
     /// <summary>

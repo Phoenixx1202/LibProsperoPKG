@@ -73,10 +73,23 @@ public readonly struct PfsBlock
     public bool IsBareEntropy { get; init; }
 
     /// <summary>
-    /// For a two-chunk compressed block, the compressed size in bytes of the first chunk (recovered
-    /// from the boundary size hint); zero otherwise. The second chunk occupies the remaining bytes.
+    /// The compressed size in bytes of the block's first sub-chunk, recovered from the boundary size
+    /// hint. The second sub-chunk, when present, occupies the remaining bytes. The hint carries this
+    /// value for every block, including single-sub-chunk and stored blocks.
     /// </summary>
     public int FirstChunkCompressedSize { get; init; }
+
+    /// <summary>
+    /// The uncompressed size in bytes of the block's first sub-chunk: the whole block for a block of
+    /// at most 128 KiB, otherwise exactly 128 KiB.
+    /// </summary>
+    public int Chunk0UncompressedSize { get; init; }
+
+    /// <summary>
+    /// The uncompressed size in bytes of the block's second sub-chunk, or zero when the block has one
+    /// sub-chunk.
+    /// </summary>
+    public int Chunk1UncompressedSize { get; init; }
 
     /// <summary>
     /// The newLZ literal model for this compressed block, recovered from the boundary flag's low bit
@@ -218,6 +231,10 @@ public sealed class ProsperoCompressedPfsFile
     /// </exception>
     public byte[] Decompress()
     {
+        if (UncompressedSize > Array.MaxLength)
+            throw new NotSupportedException(
+                $"The container expands to {UncompressedSize:N0} bytes, which no single array can hold. " +
+                "Decompress it block by block instead.");
         var output = new byte[UncompressedSize];
         foreach (PfsBlock block in Blocks)
         {
@@ -335,8 +352,12 @@ public sealed class ProsperoCompressedPfsFile
             ushort id = BinaryPrimitives.ReadUInt16LittleEndian(span[pos..]);
             if (id == 0)
                 break;
-            long offset = BinaryPrimitives.ReadUInt32LittleEndian(span[(pos + 2)..]);
-            long size = BinaryPrimitives.ReadUInt32LittleEndian(span[(pos + 10)..]);
+            // Both fields are 48 bits: a low 32-bit word and a 16-bit high word, so a container may
+            // exceed 4 GiB.
+            long offset = BinaryPrimitives.ReadUInt32LittleEndian(span[(pos + 2)..])
+                          | ((long)BinaryPrimitives.ReadUInt16LittleEndian(span[(pos + 6)..]) << 32);
+            long size = BinaryPrimitives.ReadUInt32LittleEndian(span[(pos + 10)..])
+                        | ((long)BinaryPrimitives.ReadUInt16LittleEndian(span[(pos + 14)..]) << 32);
             sections[id] = (offset, size);
         }
 
@@ -392,8 +413,15 @@ public sealed class ProsperoCompressedPfsFile
             // sub-chunks. This is authoritative; the boundary flag bit varies (newLZ uses 0x20 or 0x40,
             // bare-entropy uses 0x40), so the uncompressed size — not a flag bit — drives the split.
             bool multiChunk = !stored && uncompSize > ChunkMaxUncompressed;
-            bool bareEntropy = !stored && (flags & NewLzFlagBit) == 0;
-            int firstChunkComp = multiChunk ? sizeHint + 1 : 0;
+            // Sub-chunk geometry. The size hint always carries (sub-chunk 0 compressed length - 1),
+            // for single-sub-chunk and stored blocks as well, so the split is recovered uniformly.
+            int firstChunkComp = sizeHint + 1;
+            int chunk0Uncomp = uncompSize < ChunkMaxUncompressed ? uncompSize : ChunkMaxUncompressed;
+            int chunk1Uncomp = uncompSize - chunk0Uncomp;
+            // A sub-chunk whose compressed length equals its uncompressed length is a verbatim copy.
+            // That is decided per sub-chunk, so a block can mix a copied sub-chunk with a coded one.
+            bool chunk0Raw = firstChunkComp == chunk0Uncomp;
+            bool bareEntropy = !chunk0Raw && (flags & NewLzFlagBit) == 0;
             int literalMode = (flags & 1) != 0 ? 0 : 1;
 
             ReadOnlyMemory<byte> hash = ReadOnlyMemory<byte>.Empty;
@@ -414,6 +442,8 @@ public sealed class ProsperoCompressedPfsFile
                 FirstChunkCompressedSize = firstChunkComp,
                 LiteralMode = literalMode,
                 Flags = (int)flags,
+                Chunk0UncompressedSize = chunk0Uncomp,
+                Chunk1UncompressedSize = chunk1Uncomp,
             });
         }
 
