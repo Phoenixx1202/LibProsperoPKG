@@ -187,7 +187,7 @@ public static class ProsperoPfsImage
     /// <summary>
     /// Proves the encrypt/decrypt pair is loss-less for a given image without leaving any
     /// artefacts: encrypts a temporary copy, decrypts it back and compares the filesystem
-    /// data (every sector after the plaintext header block) to the original byte-for-byte.
+    /// data (every sector after the plaintext header block) to the original exactly.
     /// The header block legitimately gains the seed + encrypted-mode metadata, so it is
     /// excluded from the comparison. Used as the self-check that replaces on-hardware
     /// testing for the image crypto.
@@ -256,7 +256,7 @@ public static class ProsperoPfsImage
 
         // Derive the AES-XTS (tweak, data) key pair.
         var (tweakKey, dataKey) = Crypto.PfsGenEncKey(ekpfs, seed, options.NewCrypt);
-        var transform = new XtsBlockTransform(dataKey, tweakKey);
+        using var transform = new XtsBlockTransform(dataKey, tweakKey);
 
         long startSector = blockSize / XtsSectorSize; // header block (block 0) stays plaintext
         long totalSectors = length / XtsSectorSize;

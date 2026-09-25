@@ -2,18 +2,17 @@
 // Copyright (C) 2026 SvenGDK
 //
 // ---------------------------------------------------------------------------------------------------
-// Kraken (newLZ) decoder for "nwonly" PFSv3 Kraken blocks: entropy-coded
+// Kraken (newLZ) decoder for PFSv3 Kraken blocks: entropy-coded
 // literals/commands/offsets/lengths, the post-seed 0x80 "excess" framing, and both literal models,
 // including the excess-substream length escapes and continuation-byte excess-count parse.
 //
-// Portions of the decode logic are an index-based translation of a GPLv3-licensed third-party
-// decompressor; see NOTICE for the attribution. LibProsperoPkg as a whole is licensed under the
-// GNU GPLv3; section 13 of the GPLv3 expressly permits conveying a work that links/combines
-// GPLv3-covered code. Uses byte[]/int indices only.
+// Portions of the decode logic carry a GPLv3 attribution; see NOTICE. LibProsperoPkg as a whole is
+// licensed under the GNU GPLv3; section 13 of the GPLv3 expressly permits conveying a work that
+// links/combines GPLv3-covered code. Uses byte[]/int indices only.
 //
 // Supported chunk-decode (DecodeBytes) array types: 0 (raw / memcpy-short) and 2/4 (Huffman, both
 // code-length encodings + single/triple stream split). Types 1 (TANS), 3 (RLE) and 5 (recursive /
-// multi-array) are reported as unsupported; reference level-7 nwonly blocks observed here use only
+// multi-array) are reported as unsupported; level-7 nwonly blocks observed here use only
 // raw + Huffman, but the dispatcher surfaces any unsupported type cleanly rather than silently failing.
 // ---------------------------------------------------------------------------------------------------
 #nullable enable
@@ -42,37 +41,28 @@ internal enum KrakenDecodeStatus
 /// <summary>
 /// A complete managed Kraken (newLZ) chunk decoder. Decodes one PFS block (one or two internal
 /// newLZ chunks) into a caller-supplied destination buffer. This is the production decoder used by
-/// <see cref="ProsperoCompressedPfsFile"/> to read both this library's own output and reference-produced blocks.
+/// <see cref="ProsperoCompressedPfsFile"/> to read both this library's own output and compatible encoded blocks.
 /// </summary>
 internal static class KrakenDecoder
 {
     private const int ChunkMax = 0x20000; // a single newLZ chunk decodes at most 128 KiB
     private const int SeedSize = 8;
 
-    /// <summary>
-    /// Diagnostic seam: when non-null, invoked once per decoded LZ command with
-    /// (litRunLen, matchLen, distance, offsIndex). offsIndex 0/1/2 = recent-offset reuse, 3 = new
-    /// offset; the final literal tail is reported as (tailLen, 0, 0, -1). Used by diagnostics
-    /// to extract the reference parse from a real chunk. Null in production (zero cost).
-    /// </summary>
-    internal static System.Action<int, int, int, int>? ParseTrace;
-
-    /// <summary>
-    /// Diagnostic seam: when non-null, invoked with (label, srcOffset) at each newLZ array boundary
-    /// ("litStart", "litEnd", "cmdEnd", "offsEnd", "litlenEnd"). Lets a diagnostic map which entropy
-    /// array a byte-divergence falls in. Null in production (zero cost).
-    /// </summary>
-    internal static System.Action<string, int>? ArrayTrace;
-
     // Boundary flag byte bits (the on-disk id=3 entry's per-chunk markers).
     // The low nibble describes the first sub-chunk, the high nibble the second: a 256 KiB block is two
     // 128 KiB sub-chunks whose types are INDEPENDENT (newLZ or bare-entropy), so each is decoded on its
-    // own per these bits. Validated empirically across newLZ/entropy/mixed inputs and against the
+    // own per these bits. These bits cover newLZ, entropy, and mixed inputs and align with the
     // frame rebuilder's bit-38 newLZ flag.
+    // The flag byte is two independent 4-bit groups, one per sub-chunk: bit 0 literal model,
+    // bit 1 LZ enable, bit 2 restart (decode at output position 0), bit 3 verbatim copy — and
+    // bits 4..7 the same four for sub-chunk 1. Sub-chunk 0 always decodes at position 0, so its
+    // restart bit carries no extra information; the verbatim-copy bits agree with the authoritative
+    // size test (compressed length == uncompressed length) and are not read.
     private const int Chunk0SubLitBit = 0x01; // chunk0 literal model: set = sub/delta (mode 0), clear = raw (mode 1)
     private const int Chunk0NewLzBit = 0x02;  // chunk0 is newLZ; clear = bare-entropy array
     private const int Chunk1SubLitBit = 0x10; // chunk1 literal model (same encoding as chunk0)
-    private const int Chunk1NewLzBit = 0x20;  // chunk1 is newLZ; clear (with 0x40) = bare-entropy array
+    private const int Chunk1NewLzBit = 0x20;  // chunk1 is newLZ; clear = bare-entropy array
+    private const int Chunk1RestartBit = 0x40; // chunk1 decodes at output position 0 instead of ChunkMax
 
     /// <summary>
     /// Decodes a whole PFS block (the section-7 payload) into <paramref name="dst"/> (sized to the
@@ -94,44 +84,64 @@ internal static class KrakenDecoder
         byte[] src = payload.ToArray();
         byte[] outBuf = new byte[dst.Length];
 
-        bool chunk0NewLz = (flags & Chunk0NewLzBit) != 0;
-        int litMode0 = (flags & Chunk0SubLitBit) != 0 ? 0 : 1;
-        bool multiChunk = dst.Length > ChunkMax;
+        // Sub-chunk geometry. The size hint carries sub-chunk 0's compressed length for every block,
+        // so both sub-chunks are located the same way whether or not the block is split.
+        int chunk0Dst = dst.Length < ChunkMax ? dst.Length : ChunkMax;
+        int chunk1Dst = dst.Length - chunk0Dst;
+        int chunk0Comp = chunk1Dst == 0 ? src.Length : firstChunkComp;
+        if (chunk0Comp <= 0 || chunk0Comp > src.Length)
+            return KrakenDecodeStatus.Malformed;
+        int chunk1Comp = src.Length - chunk0Comp;
+        if (chunk1Dst == 0 && chunk1Comp != 0)
+            return KrakenDecodeStatus.Malformed;
 
-        KrakenDecodeStatus st;
-        if (!multiChunk)
+        KrakenDecodeStatus st = DecodeSubChunk(
+            src, 0, chunk0Comp, outBuf, 0, chunk0Dst,
+            lzEnable: (flags & Chunk0NewLzBit) != 0,
+            restart: true,
+            literalMode: (flags & Chunk0SubLitBit) != 0 ? 0 : 1);
+        if (st != KrakenDecodeStatus.Success)
+            return st;
+
+        if (chunk1Dst > 0)
         {
-            st = chunk0NewLz
-                ? DecodeChunk(src, 0, src.Length, outBuf, 0, dst.Length, withSeed: true, litMode0)
-                : DecodeBareEntropyBlock(src, 0, src.Length, outBuf, 0, dst.Length);
-        }
-        else
-        {
-            if (firstChunkComp <= 0 || firstChunkComp > src.Length || dst.Length <= ChunkMax)
-                return KrakenDecodeStatus.Malformed;
-
-            bool chunk1NewLz = (flags & Chunk1NewLzBit) != 0;
-            int litMode1 = (flags & Chunk1SubLitBit) != 0 ? 0 : 1;
-            int chunk1Comp = src.Length - firstChunkComp;
-            int chunk1Dst = dst.Length - ChunkMax;
-
-            // Sub-chunk 0 -> [0:ChunkMax].
-            st = chunk0NewLz
-                ? DecodeChunk(src, 0, firstChunkComp, outBuf, 0, ChunkMax, withSeed: true, litMode0)
-                : DecodeBareEntropyBlock(src, 0, firstChunkComp, outBuf, 0, ChunkMax);
+            // Sub-chunk 1 normally continues the same output window, so a newLZ sub-chunk 1 may
+            // back-reference sub-chunk 0's bytes; the restart bit instead makes it decode as its own
+            // window at position 0, with its own seed and no back-references.
+            st = DecodeSubChunk(
+                src, chunk0Comp, chunk1Comp, outBuf, chunk0Dst, chunk1Dst,
+                lzEnable: (flags & Chunk1NewLzBit) != 0,
+                restart: (flags & Chunk1RestartBit) != 0,
+                literalMode: (flags & Chunk1SubLitBit) != 0 ? 0 : 1);
             if (st != KrakenDecodeStatus.Success)
                 return st;
-
-            // Sub-chunk 1 -> [ChunkMax:end], seedless; a newLZ chunk1 may back-reference chunk0's bytes
-            // regardless of how chunk0 was decoded (they share the destination buffer).
-            st = chunk1NewLz
-                ? DecodeChunk(src, firstChunkComp, chunk1Comp, outBuf, ChunkMax, chunk1Dst, withSeed: false, litMode1)
-                : DecodeBareEntropyBlock(src, firstChunkComp, chunk1Comp, outBuf, ChunkMax, chunk1Dst);
         }
 
-        if (st == KrakenDecodeStatus.Success)
-            outBuf.AsSpan(0, dst.Length).CopyTo(dst);
+        outBuf.AsSpan(0, dst.Length).CopyTo(dst);
         return st;
+    }
+
+    /// <summary>
+    /// Decodes one sub-chunk into <paramref name="outBuf"/> at <paramref name="dstStart"/>. A sub-chunk
+    /// whose compressed length equals its uncompressed length is a verbatim copy; otherwise it is a
+    /// newLZ sub-chunk when <paramref name="lzEnable"/> is set and a single entropy array when it is not.
+    /// <paramref name="restart"/> selects a fresh output window (own seed, no back-references) instead of
+    /// continuing the block's window.
+    /// </summary>
+    private static KrakenDecodeStatus DecodeSubChunk(
+        byte[] src, int srcStart, int srcLen, byte[] outBuf, int dstStart, int dstLen,
+        bool lzEnable, bool restart, int literalMode)
+    {
+        if (srcLen < 0 || srcStart + srcLen > src.Length || dstLen < 0 || dstStart + dstLen > outBuf.Length)
+            return KrakenDecodeStatus.Malformed;
+        if (srcLen == dstLen)
+        {
+            Array.Copy(src, srcStart, outBuf, dstStart, dstLen);
+            return KrakenDecodeStatus.Success;
+        }
+        return lzEnable
+            ? DecodeChunk(src, srcStart, srcLen, outBuf, dstStart, dstLen, withSeed: restart, literalMode)
+            : DecodeBareEntropyBlock(src, srcStart, srcLen, outBuf, dstStart, dstLen);
     }
 
     /// <summary>
@@ -207,7 +217,7 @@ internal static class KrakenDecoder
             sp += SeedSize;
         }
 
-        // Excess framing: reference chunks set the post-seed control byte's 0x80 bit.
+        // Excess framing: encoded chunks set the post-seed control byte's 0x80 bit.
         bool excessFlag = false;
         int excessCount = 0;
         if (sp < srcEnd && (src[sp] & 0x80) != 0)
@@ -229,19 +239,16 @@ internal static class KrakenDecoder
         }
 
         // Lit stream (bounded by dst_size).
-        ArrayTrace?.Invoke("litStart", sp);
         int n = DecodeBytes(src, sp, srcEnd, dstSize, out byte[] lit, out int litCount);
         if (n < 0) return n;
         sp += n;
         lzt.LitStream = lit; lzt.LitStreamSize = litCount;
 
         // Command stream (bounded by dst_size).
-        ArrayTrace?.Invoke("litEnd", sp);
         n = DecodeBytes(src, sp, srcEnd, dstSize, out byte[] cmd, out int cmdCount);
         if (n < 0) return n;
         sp += n;
         lzt.CmdStream = cmd; lzt.CmdStreamSize = cmdCount;
-        ArrayTrace?.Invoke("cmdEnd", sp);
 
         if (srcEnd - sp < 3)
             return -1;
@@ -276,12 +283,10 @@ internal static class KrakenDecoder
         lzt.OffsStreamSize = offsCount;
 
         // Packed litlen stream (bounded by dst_size / 4).
-        ArrayTrace?.Invoke("offsEnd", sp);
         n = DecodeBytes(src, sp, srcEnd, dstSize >> 2, out byte[] packedLitLen, out int lenCount);
         if (n < 0) return n;
         sp += n;
         lzt.LenStreamSize = lenCount;
-        ArrayTrace?.Invoke("litlenEnd", sp);
 
         lzt.OffsStream = new int[offsCount];
         lzt.LenStream = new int[lenCount];
@@ -370,7 +375,7 @@ internal static class KrakenDecoder
             {
                 if (!ea.ReadLength(out u32[i])) return false;
             }
-            // (the excess seam is allowed to differ; the reference only asserts it for the main bitstream)
+            // The excess seam is allowed to differ; only the main bitstream seam is asserted.
         }
         else
         {
@@ -476,221 +481,12 @@ internal static class KrakenDecoder
                 used = DecodeBytesType12(src, sp, srcSize, output, dstSize, chunkType >> 1);
                 break;
             default:
-                // 1 (TANS), 3 (RLE), 5 (recursive/multi-array): not emitted by reference nwonly lvl-7 here.
+                // 1 (TANS), 3 (RLE), 5 (recursive/multi-array): not emitted by the supported nwonly lvl-7 path here.
                 return -2;
         }
         if (used != srcSize) return -1;
         decodedSize = dstSize;
         return sp + srcSize - srcOrg;
-    }
-
-    /// <summary>Diagnostic descriptor for one entropy/raw array inside a chunk.</summary>
-    internal sealed class KrakenArrayInfo
-    {
-        public string Name = "";
-        public int SrcOffset;          // absolute offset of the array's first byte in src
-        public int SrcLen;             // bytes the array occupies (header + payload)
-        public int ChunkType;          // (src[off] >> 4) & 7  — 0 raw, 2 single-3-stream, 4 two-core, 1 TANS, 3 RLE, 5 recursive
-        public int Transmission = -1;  // entropy code-length transmission: 0 = simple, 1 = RLE; -1 = raw
-        public byte[] Decoded = Array.Empty<byte>();
-    }
-
-    /// <summary>
-    /// Walks a single newLZ chunk exactly like <see cref="ReadLzTable"/> but, instead of building the LZ
-    /// table, records each entropy/raw array's exact byte span, chunk type and code-length transmission
-    /// plus its decoded bytes. Used by diagnostics to compare this library's entropy encoding against
-    /// reference arrays byte-for-byte. Returns 0 on success or a negative error.
-    /// </summary>
-    internal static int InspectChunkArrays(byte[] src, int sp, int srcEnd, int offset, int dstSize, out System.Collections.Generic.List<KrakenArrayInfo> arrays)
-    {
-        var list = new System.Collections.Generic.List<KrakenArrayInfo>();
-        arrays = list;
-
-        if (offset == 0)
-        {
-            if (srcEnd - sp < SeedSize) return -1;
-            sp += SeedSize;
-        }
-
-        if (sp < srcEnd && (src[sp] & 0x80) != 0)
-        {
-            byte flag = src[sp++];
-            if ((flag & 0xC0) != 0x80) return -1;
-            int excessCount = flag & 0x3F;
-            if (excessCount > 0x1F)
-            {
-                if (sp >= srcEnd) return -1;
-                excessCount += src[sp++] * 0x20;
-            }
-            srcEnd -= excessCount;
-            if (srcEnd < sp) return -1;
-        }
-
-        KrakenArrayInfo? Record(string name, int cap, out int err)
-        {
-            int arrStart = sp;
-            int n = DecodeBytes(src, sp, srcEnd, cap, out byte[] dec, out int decCount);
-            err = n;
-            if (n < 0) return null;
-            var info = new KrakenArrayInfo
-            {
-                Name = name,
-                SrcOffset = arrStart,
-                SrcLen = n,
-                ChunkType = (src[arrStart] >> 4) & 0x7,
-                Decoded = dec.Length == decCount ? dec : dec[..decCount],
-            };
-            info.Transmission = PeekTransmission(src, arrStart, arrStart + n, info.ChunkType);
-            sp += n;
-            list.Add(info);
-            return info;
-        }
-
-        if (Record("lit", dstSize, out int eLit) is null) return eLit;
-        int cmdCap = dstSize;
-        var cmdInfo = Record("cmd", cmdCap, out int eCmd);
-        if (cmdInfo is null) return eCmd;
-        int cmdCount = cmdInfo.Decoded.Length;
-
-        if (srcEnd - sp < 3) return -10;
-        if ((src[sp] & 0x80) != 0)
-        {
-            int offsScaling = src[sp] - 127;
-            sp++;
-            var offsInfo = Record("offs", cmdCount, out int eOffs);
-            if (offsInfo is null) return eOffs;
-            if (offsScaling != 1)
-            {
-                if (Record("offsExtra", offsInfo.Decoded.Length, out int eEx) is null) return eEx;
-            }
-        }
-        else
-        {
-            if (Record("offs", cmdCount, out int eOffs) is null) return eOffs;
-        }
-
-        if (Record("litlen", dstSize >> 2, out int eLen) is null) return eLen;
-        return 0;
-    }
-
-    // Peeks the code-length transmission selector (first 1-2 stream bits) of an entropy array.
-    private static int PeekTransmission(byte[] src, int sp, int arrEnd, int chunkType)
-    {
-        if (chunkType != 2 && chunkType != 4) return -1;
-        int headerLen = src[sp] >= 0x80 ? 3 : 5;
-        int payStart = sp + headerLen;
-        if (payStart >= arrEnd) return -1;
-        var bits = RefBitReader.Forward(src, payStart, arrEnd);
-        if (bits.ReadBitNoRefill() == 0) return 0; // Old/simple
-        if (bits.ReadBitNoRefill() == 0) return 1; // New/RLE
-        return 2;                                   // reserved
-    }
-
-    // Diagnostic snapshot of a chunk-type-2/4 entropy array's Huffman header (M2 divergence probe).
-    // Read-only: re-parses the header (length + code-length transmission + split sizes) and reconstructs
-    // the per-symbol code-length table without decoding the 3-stream payload. Used to localize exactly
-    // where this encoder diverges from the reference (tree shape vs transmission vs split vs bit-packing).
-    internal sealed class Type12Info
-    {
-        public int ChunkType;            // 2 (single 3-stream) or 4 (two-core 6-stream)
-        public int HeaderLen;            // 3 or 5
-        public int SrcSize;              // array byte length after the header
-        public int DstSize;              // decoded byte count
-        public int Transmission = -1;    // 0 = Old/simple, 1 = New/RLE, 2 = reserved
-        public int NumSyms;
-        public int CodeLenEndOffset;     // byte offset (into src) right after the code-length transmission
-        public int SplitMid = -1;        // type2: 2-byte mid split; type4: 3-byte outer split
-        public int SplitLeft = -1;       // type4 only
-        public int SplitRight = -1;      // type4 only
-        public int PayloadOffset = -1;   // byte offset where the coded 3-stream payload begins
-        public byte[] CodeLengths = new byte[256]; // per-symbol bit length, 0 = symbol absent
-    }
-
-    // Re-parses a type-2/4 entropy array starting at src[sp] (over [sp, srcEnd)). Returns false if the
-    // bytes are not a well-formed type-2/4 Huffman header. Pure diagnostic; mutates nothing.
-    internal static bool InspectType12(byte[] src, int sp, int srcEnd, out Type12Info info)
-    {
-        info = new Type12Info();
-        if (src is null || sp < 0 || srcEnd > src.Length || srcEnd - sp < 2) return false;
-        int chunkType = (src[sp] >> 4) & 7;
-        if (chunkType != 2 && chunkType != 4) return false;
-        info.ChunkType = chunkType;
-
-        int srcSize, dstSize, headerLen;
-        if (src[sp] >= 0x80)
-        {
-            if (srcEnd - sp < 3) return false;
-            uint b = (uint)((src[sp] << 16) | (src[sp + 1] << 8) | src[sp + 2]);
-            srcSize = (int)(b & 0x3FF);
-            dstSize = (int)(srcSize + ((b >> 10) & 0x3FF) + 1);
-            headerLen = 3;
-        }
-        else
-        {
-            if (srcEnd - sp < 5) return false;
-            uint b = (uint)((src[sp + 1] << 24) | (src[sp + 2] << 16) | (src[sp + 3] << 8) | src[sp + 4]);
-            srcSize = (int)(b & 0x3FFFF);
-            dstSize = (int)(((((uint)src[sp] << 14) | (b >> 18)) & 0x3FFFF) + 1);
-            headerLen = 5;
-        }
-        info.SrcSize = srcSize;
-        info.DstSize = dstSize;
-        info.HeaderLen = headerLen;
-
-        int payStart = sp + headerLen;
-        int arrEnd = payStart + srcSize;
-        if (arrEnd > srcEnd || payStart >= arrEnd) return false;
-
-        var bits = RefBitReader.Forward(src, payStart, arrEnd);
-        uint[] codePrefix = (uint[])CodePrefixOrg.Clone();
-        byte[] syms = new byte[1280];
-
-        int numSyms;
-        if (bits.ReadBitNoRefill() == 0)
-        {
-            info.Transmission = 0;
-            numSyms = HuffReadCodeLengthsOld(ref bits, syms, codePrefix);
-        }
-        else if (bits.ReadBitNoRefill() == 0)
-        {
-            info.Transmission = 1;
-            numSyms = HuffReadCodeLengthsNew(ref bits, syms, codePrefix);
-        }
-        else
-        {
-            info.Transmission = 2;
-            return false;
-        }
-        if (numSyms < 1) return false;
-        info.NumSyms = numSyms;
-
-        // Reconstruct per-symbol code lengths: syms[prefixOrg[cl] .. codePrefix[cl]) all have length cl.
-        for (int cl = 1; cl <= 11; cl++)
-            for (uint k = CodePrefixOrg[cl]; k < codePrefix[cl]; k++)
-                info.CodeLengths[syms[k]] = (byte)cl;
-
-        int spAfter = bits.P - ((24 - bits.BitPos) / 8);
-        info.CodeLenEndOffset = spAfter;
-
-        if (numSyms == 1) { info.PayloadOffset = spAfter; return true; }
-
-        int t = chunkType >> 1; // 2 -> single (1); 4 -> two-core (2)
-        if (t == 1)
-        {
-            if (spAfter + 2 > arrEnd) return false;
-            info.SplitMid = src[spAfter] | (src[spAfter + 1] << 8);
-            info.PayloadOffset = spAfter + 2;
-        }
-        else
-        {
-            if (spAfter + 5 > arrEnd) return false;
-            info.SplitMid = src[spAfter] | (src[spAfter + 1] << 8) | (src[spAfter + 2] << 16);
-            info.SplitLeft = src[spAfter + 3] | (src[spAfter + 4] << 8);
-            int srcMid = spAfter + 3 + info.SplitMid;
-            if (srcMid + 2 <= arrEnd) info.SplitRight = src[srcMid] | (src[srcMid + 1] << 8);
-            info.PayloadOffset = spAfter + 5;
-        }
-        return true;
     }
 
     // ===========================================================================================
@@ -722,9 +518,11 @@ internal static class KrakenDecoder
 
         if (numSyms == 1)
         {
+            // A single-symbol array carries no payload streams: the whole compressed array is the
+            // code-length header. Report the full source size consumed, matching the caller's contract.
             byte fill = syms[0];
             for (int i = 0; i < outputSize; i++) output[i] = fill;
-            return sp - srcEnd;
+            return srcSize;
         }
 
         var lut = new NewHuffLut();
@@ -1107,8 +905,8 @@ internal static class KrakenDecoder
         public byte[] B;
         public byte[] Out;
         public int Src, SrcEnd, SrcMid, SrcMidOrg;
-        public uint SrcBits, SrcMidBits, SrcEndBits;
-        public int SrcBitpos, SrcMidBitpos, SrcEndBitpos;
+        public uint SrcBits = 0, SrcMidBits = 0, SrcEndBits = 0;
+        public int SrcBitpos = 0, SrcMidBitpos = 0, SrcEndBitpos = 0;
         public int OutOff, OutEnd;
         public HuffReader(byte[] b, byte[] o) : this()
         {
@@ -1298,7 +1096,6 @@ internal static class KrakenDecoder
                 actual = 14 + (uint)len[lenPos++];
             }
             if (dstPos + actual > (uint)dstEnd) return false;
-            ParseTrace?.Invoke((int)litlen, (int)actual, -offset, offsIndex);
             for (uint c = 0; c < actual; c++) dst[dstPos + c] = dst[copyFrom + c];
             dstPos += (int)actual;
         }
@@ -1306,7 +1103,6 @@ internal static class KrakenDecoder
         if (offsPos != offsEnd || lenPos != lenEnd) return false;
         int finalLen = dstEnd - dstPos;
         if (finalLen != litEnd - litPos) return false;
-        ParseTrace?.Invoke(finalLen, 0, 0, -1);
         for (int c = 0; c < finalLen; c++) dst[dstPos + c] = lit[litPos + c];
         return true;
     }
@@ -1367,7 +1163,6 @@ internal static class KrakenDecoder
                 actual = 14 + (uint)len[lenPos++];
             }
             if (dstPos + actual > (uint)dstEnd) return false;
-            ParseTrace?.Invoke((int)litlen, (int)actual, -offset, offsIndex);
             for (uint c = 0; c < actual; c++) dst[dstPos + c] = dst[copyFrom + c];
             dstPos += (int)actual;
         }
@@ -1375,7 +1170,6 @@ internal static class KrakenDecoder
         if (offsPos != offsEnd || lenPos != lenEnd) return false;
         int finalLen = dstEnd - dstPos;
         if (finalLen != litEnd - litPos) return false;
-        ParseTrace?.Invoke(finalLen, 0, 0, -1);
         for (int c = 0; c < finalLen; c++)
             dst[dstPos + c] = (byte)(lit[litPos + c] + dst[dstPos + c + lastOffset]);
         return true;

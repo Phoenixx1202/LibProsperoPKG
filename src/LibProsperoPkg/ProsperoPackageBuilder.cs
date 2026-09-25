@@ -1,16 +1,16 @@
 // LibProsperoPkg - A library for building and inspecting PS5 packages.
 // Copyright (C) 2026 SvenGDK
 //
-// High-level PS5 package builder. Turns a prepared application
-// folder into a complete, signed PS5 package entirely in-process: there is no external tool to
-// install and no platform-specific shell-out. The GP5 project model, the inner/outer PFS image,
-// the AES-XTS encryption, the RSA-3072 metadata signature and the finalized debug image are all
-// produced by this library. The PS5 publishing key material is wired in through
+// High-level PS5 package builder. Turns a prepared application folder into a complete, signed PS5
+// package. The GP5 project model, the inner/outer PFS image, the AES-XTS encryption, the RSA-3072
+// metadata signature and the finalized debug image are produced by this library. The PS5 publishing
+// key material is wired in through
 // <see cref="LibProsperoPkg.Keys.ProsperoKeys"/> and the signing path through
 // <see cref="LibProsperoPkg.PKG.ProsperoPkgSigner"/>.
 
 using LibProsperoPkg.GP5;
 using LibProsperoPkg.Keys;
+using LibProsperoPkg.Metadata;
 using LibProsperoPkg.PKG;
 using System;
 using System.Collections.Generic;
@@ -18,8 +18,6 @@ using System.IO;
 using System.Linq;
 using System.Security.Cryptography;
 using System.Text;
-using System.Text.Json;
-using System.Text.Json.Nodes;
 using System.Text.RegularExpressions;
 
 namespace LibProsperoPkg;
@@ -56,7 +54,7 @@ public enum InnerImageForm
     /// A PS5 PFSv3 Kraken-compressed PFS image — the codec the
     /// <c>nwonly</c> path uses for the inner image. The container is self-describing
     /// (magic <c>PFSC</c>, format version 3, 0x40000 blocks, SHA3-256 digests) and is round-trip
-    /// validated in-process with the managed Kraken decoder. Distinct from <see cref="Compressed"/>,
+    /// validated in-process with the Kraken decoder. Distinct from <see cref="Compressed"/>,
     /// which is the zlib PFSC used for the installable inner image.
     /// </summary>
     KrakenCompressed,
@@ -119,26 +117,55 @@ public sealed class ProsperoBuildOptions
     public bool GenerateParamJsonIfMissing { get; set; } = true;
 
     /// <summary>
-    /// When true the inner <c>pfs_image.dat</c> is stored PFSC-compressed (shrinking the package,
-    /// the dominant size driver) instead of raw. Incompressible images fall back to the raw wrapper
-    /// automatically. Off by default to preserve the size-stable path. This is the zlib
-    /// PFSC used for the installable inner image; for the <c>nwonly</c> Kraken codec
-    /// set <see cref="InnerCompression"/> to <see cref="ProsperoInnerCompression.Kraken"/> instead.
+    /// The application type recorded in a generated <c>param.json</c> ("Paid Standalone Full App",
+    /// "Upgradable App", "Demo App", "Freemium App"). It is written as the <c>applicationDrmType</c>
+    /// bucket (and drives the <c>pfsimage.xml</c> <c>&lt;application-type&gt;</c>). Defaults to
+    /// <see cref="ProsperoApplicationType.NotSpecified"/> (a free/debug package). Only affects a
+    /// param.json the builder generates; an existing <c>sce_sys/param.json</c> is used verbatim.
     /// </summary>
-    public bool CompressInnerImage { get; set; }
+    public ProsperoApplicationType ApplicationType { get; set; } = ProsperoApplicationType.NotSpecified;
 
     /// <summary>
-    /// Selects the inner-image codec explicitly. When left at <see cref="ProsperoInnerCompression.None"/>
-    /// the legacy <see cref="CompressInnerImage"/> flag decides (true =&gt; <see cref="ProsperoInnerCompression.Zlib"/>).
-    /// When set to a non-<c>None</c> value this takes precedence over <see cref="CompressInnerImage"/>:
-    /// <list type="bullet">
-    /// <item><see cref="ProsperoInnerCompression.Zlib"/> — zlib PFSC (installable inner image).</item>
-    /// <item><see cref="ProsperoInnerCompression.Kraken"/> — PS5 PFSv3 Kraken (the
-    /// <c>nwonly</c> inner-image codec), validated against reference output.
-    /// Incompressible images fall back to the raw wrapper automatically.</item>
-    /// </list>
+    /// Explicit override for the generated <c>param.json</c> <c>applicationDrmType</c> token
+    /// (e.g. <c>free</c>, <c>standard</c>, <c>freemium</c>). When <see langword="null"/> the value is
+    /// derived from <see cref="ApplicationType"/>.
     /// </summary>
-    public ProsperoInnerCompression InnerCompression { get; set; } = ProsperoInnerCompression.None;
+    public string? ApplicationDrmType { get; set; }
+
+    /// <summary>
+    /// Optional <c>contentBadgeType</c> written to a generated <c>param.json</c>. When
+    /// <see langword="null"/> the field is omitted.
+    /// </summary>
+    public int? ContentBadgeType { get; set; }
+
+    /// <summary>
+    /// When <see langword="true"/>, raw ELF executable modules in the source folder
+    /// are fake-signed (converted to a debug fake-self via
+    /// <see cref="LibProsperoPkg.Content.ProsperoFself.MakeFself"/>) before packing, producing an
+    /// installable fake package (fPKG). Files that are already SELF are left untouched. The conversion
+    /// is non-destructive: the original module bytes are restored
+    /// after the build. Off by default.
+    /// </summary>
+    public bool FakeSignSelfModules { get; set; }
+
+    /// <summary>
+    /// Fake-self options (app/firmware version, authority-id override) applied when
+    /// <see cref="FakeSignSelfModules"/> is enabled. When <see langword="null"/> the defaults are used
+    /// (versions <c>0</c>, authority id derived from the ELF).
+    /// </summary>
+    public LibProsperoPkg.Content.FselfOptions? FselfOptions { get; set; }
+
+    /// <summary>
+    /// When <see langword="true"/> the build produces a license-free debug package: raw ELF modules
+    /// are fake-signed (as with <see cref="FakeSignSelfModules"/>) and the mount key is derived from
+    /// the content id and passcode, so no license record is written. The DRM-free behavior comes from
+    /// the fake-signed modules and the derived mount key. A generated <c>param.json</c> records the
+    /// <c>free</c> <c>applicationDrmType</c> bucket as descriptive metadata; an existing
+    /// <c>param.json</c> is used verbatim, and its <c>applicationDrmType</c> field does not affect the
+    /// mount. The output stays a debug (FIH) image, the form a debug-mode console installs. Off by
+    /// default.
+    /// </summary>
+    public bool LicenseFree { get; set; }
 }
 
 /// <summary>The result of a build: the output path plus any non-fatal warnings.</summary>
@@ -146,6 +173,20 @@ public sealed class ProsperoBuildResult
 {
     public required string OutputPath { get; init; }
     public required IReadOnlyList<string> Warnings { get; init; }
+
+    /// <summary>
+    /// The debug grant for this package when <see cref="ProsperoBuildOptions.LicenseFree"/> is set:
+    /// the content id and passcode whose EKPFS the mount path recomputes. <see langword="null"/> for a
+    /// standard build.
+    /// </summary>
+    public LibProsperoPkg.License.ProsperoDebugLicense? DebugLicense { get; init; }
+
+    /// <summary>
+    /// True when the package was built license-free: modules fake-signed, the <c>param.json</c> DRM
+    /// bucket set to <c>free</c>, and the mount key derived from the content id and passcode with no
+    /// license record written.
+    /// </summary>
+    public bool LicenseFree { get; init; }
 }
 
 /// <summary>
@@ -307,10 +348,10 @@ public static class ProsperoPackageBuilder
     public static bool IsDlcMode(ProsperoPackageMode mode) =>
         mode is ProsperoPackageMode.AdditionalContentData or ProsperoPackageMode.AdditionalContentNoData;
 
-    /// <summary>The PS5 application category type written into a generated param.json for a mode.</summary>
+    /// <summary>The PS5 application category type written into a generated param.json.</summary>
     private static int CategoryTypeForMode(ProsperoPackageMode mode) => mode switch
     {
-        // 0 = PS5 Game/App. DLC packages carry no applicationCategoryType in their param.json.
+        // 0 = PS5 Game/App, the only category the generated param.json currently emits.
         _ => 0,
     };
 
@@ -346,10 +387,44 @@ public static class ProsperoPackageBuilder
         if (!KeysAvailable)
             warnings.Add("PS5 publishing keys are unavailable.");
 
+        // A license-free build derives its mount key from the content id and passcode, so it writes no
+        // license record. Construct the grant first so a malformed content id or passcode fails fast.
+        LibProsperoPkg.License.ProsperoDebugLicense? debugLicense = options.LicenseFree
+            ? LibProsperoPkg.License.ProsperoDebugLicense.Create(options.ContentId, options.Passcode)
+            : null;
+        if (debugLicense is not null)
+            log("License-free build: the mount key is derived from the content id and passcode; no license record is written.");
+
+        // A license-free package is also fake-signed so its modules run on a debug-mode console.
+        bool fakeSign = options.FakeSignSelfModules || options.LicenseFree;
+
         // Ensure the package has a param.json.
         EnsureParamJson(options, sourceFolder, log, warnings);
 
-        return BuildCore(options, sourceFolder, log, warnings);
+        // Fake-sign raw ELF modules in place so they run on a debug-mode console. This rewrites files
+        // in place but is non-destructive: the originals are restored once packing completes. An
+        // existing param.json is used verbatim; its applicationDrmType field is descriptive metadata
+        // and does not affect the mount.
+        //
+        // The restore list is created here and populated in place so the finally restores every module
+        // already rewritten even if preparation itself fails partway through.
+        var restore = new List<(string Path, byte[] Original)>();
+        try
+        {
+            PrepareFakeSelfModules(fakeSign, options.FselfOptions, sourceFolder, log, warnings, restore);
+            var result = BuildCore(options, sourceFolder, log, warnings);
+            return new ProsperoBuildResult
+            {
+                OutputPath = result.OutputPath,
+                Warnings = result.Warnings,
+                DebugLicense = debugLicense,
+                LicenseFree = options.LicenseFree,
+            };
+        }
+        finally
+        {
+            RestoreFakeSelfModules(restore, log);
+        }
     }
 
     /// <summary>
@@ -380,12 +455,10 @@ public static class ProsperoPackageBuilder
             ContentId = options.ContentId,
             Passcode = options.Passcode,
             VolumeType = ProsperoVolumeTypeForMode(options.Mode),
-            CompressInnerImage = options.CompressInnerImage,
-            InnerCompression = options.InnerCompression,
         };
 
         log("Building the PS5 package...");
-        LibProsperoPkg.PKG.ProsperoPkgBuilder.Build(buildProps, cntPath, out byte[]? nestedImageDigest, out var siInputs, log);
+        LibProsperoPkg.PKG.ProsperoPkgBuilder.Build(buildProps, cntPath, out byte[]? nestedImageDigest, out var siInputs, out long nestedImageSize, out long nestedMetaBaseBlocks, out var nwonlyFih, log);
 
         if (!File.Exists(cntPath))
             throw new InvalidOperationException("The PS5 PKG builder did not produce an output package.");
@@ -421,8 +494,8 @@ public static class ProsperoPackageBuilder
             log("Finalizing the CNT into a debug (FIH) image...");
 
             // The trailing debug SI segment (sce_suppl) is assembled from the finalized mount image so its
-            // playgo-chunk.crc and naps_meta_300 are byte-exact for the produced image. The reproducible
-            // pfsimage.xml options + PlayGo chunk descriptor were captured during the CNT build above.
+            // playgo-chunk.crc and naps_meta_300 describe the produced image. The pfsimage.xml options
+            // and PlayGo chunk descriptor were captured during the CNT build above.
             Func<byte[], byte[]>? siFactory = siInputs is null
                 ? null
                 : mountImage => LibProsperoPkg.PKG.ProsperoSiArchive.BuildDebugSiSegment(
@@ -431,7 +504,12 @@ public static class ProsperoPackageBuilder
             var fihWarnings = LibProsperoPkg.PKG.ProsperoFihBuilder.BuildFromCnt(
                 cntPath, finalPath, LibProsperoPkg.PKG.ProsperoFihVariant.Debug, log,
                 siArchiveFactory: siFactory,
-                nestedImageDigest: nestedImageDigest);
+                nestedImageDigest: nestedImageDigest,
+                nestedImageSize: nestedImageSize,
+                nestedMetaBaseBlocks: nestedMetaBaseBlocks,
+                nwonlyContentVersionHi: nwonlyFih?.ContentVersionHi ?? 0,
+                nwonlyInnerContentInodes: nwonlyFih?.InnerContentInodes ?? 0,
+                nwonlyAppFileCount: nwonlyFih?.AppFileCount ?? 0);
             warnings.AddRange(fihWarnings);
 
             var fihType = ProsperoPkgReader.DetectType(finalPath);
@@ -467,7 +545,7 @@ public static class ProsperoPackageBuilder
     /// </summary>
     /// <remarks>
     /// The detached signature and the checked key material are self-validated; a fully accepted
-    /// retail image additionally requires reference-controlled secrets.
+    /// retail image additionally requires console-controlled secrets.
     /// </remarks>
     private static void SignPackage(
         string pkgPath, ProsperoBuildOptions options, Action<string> log, List<string> warnings)
@@ -530,7 +608,7 @@ public static class ProsperoPackageBuilder
 
     /// <summary>
     /// Compares two PS5 containers field-by-field (parsed header and entry table). Useful to verify
-    /// that a candidate package matches a known-good reference container.
+    /// that a candidate package matches a known-good baseline container.
     /// </summary>
     /// <returns>An empty list when the containers match; otherwise the differences found.</returns>
     public static IReadOnlyList<string> CompareContainers(string referencePkg, string candidatePkg)
@@ -562,6 +640,116 @@ public static class ProsperoPackageBuilder
         return diffs;
     }
 
+    /// <summary>
+    /// Fake-signs raw ELF executable modules found under <paramref name="sourceFolder"/> in place,
+    /// converting each to a debug fake-self. Candidate files are the main executable and PRX/SPRX/ELF
+    /// modules. Files that are already SELF, or that are not a 64-bit ELF, are skipped. Unlike the
+    /// build pipeline's fake-sign step this conversion is
+    /// permanent — the original bytes are not restored.
+    /// </summary>
+    /// <param name="sourceFolder">Folder searched recursively for modules.</param>
+    /// <param name="options">Fake-self options (versions, authority-id override), or <see langword="null"/> for defaults.</param>
+    /// <param name="log">Optional progress callback.</param>
+    /// <returns>The number of modules converted.</returns>
+    public static int FakeSignModulesInPlace(
+        string sourceFolder,
+        LibProsperoPkg.Content.FselfOptions? options = null,
+        Action<string>? log = null)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(sourceFolder);
+        if (!Directory.Exists(sourceFolder))
+            throw new DirectoryNotFoundException($"Source folder not found: {sourceFolder}");
+
+        int converted = 0;
+        foreach (var path in Directory.EnumerateFiles(sourceFolder, "*", SearchOption.AllDirectories))
+        {
+            if (!IsFakeSignCandidate(Path.GetFileName(path)))
+                continue;
+
+            byte[] bytes;
+            try { bytes = File.ReadAllBytes(path); }
+            catch (IOException) { continue; }
+
+            if (!LibProsperoPkg.Content.ProsperoFself.IsElf(bytes) || LibProsperoPkg.Content.ProsperoFself.IsSelf(bytes))
+                continue;
+
+            byte[] fself = LibProsperoPkg.Content.ProsperoFself.MakeFself(bytes, options);
+            File.WriteAllBytes(path, fself);
+            converted++;
+            log?.Invoke($"Fake-signed {Path.GetRelativePath(sourceFolder, path)} ({bytes.Length} -> {fself.Length} bytes).");
+        }
+
+        return converted;
+    }
+
+    // Executable-module file names/extensions that are candidates for fake-signing before packing.
+    private static bool IsFakeSignCandidate(string fileName) =>
+        fileName.Equals("eboot.bin", StringComparison.OrdinalIgnoreCase)
+        || fileName.EndsWith(".elf", StringComparison.OrdinalIgnoreCase)
+        || fileName.EndsWith(".prx", StringComparison.OrdinalIgnoreCase)
+        || fileName.EndsWith(".sprx", StringComparison.OrdinalIgnoreCase);
+
+    // Fake-signs raw ELF modules in the source tree in place, recording each module's original bytes in
+    // <paramref name="restore"/> BEFORE it is rewritten so the caller can undo every change once packing
+    // is done — including a partial run that throws partway through. Does nothing when disabled or when
+    // there is nothing to convert. Files that are already SELF are skipped.
+    private static void PrepareFakeSelfModules(
+        bool fakeSign, LibProsperoPkg.Content.FselfOptions? fselfOptions, string sourceFolder,
+        Action<string> log, List<string> warnings, List<(string Path, byte[] Original)> restore)
+    {
+        if (!fakeSign)
+            return;
+
+        foreach (var path in Directory.EnumerateFiles(sourceFolder, "*", SearchOption.AllDirectories).ToList())
+        {
+            if (!IsFakeSignCandidate(Path.GetFileName(path)))
+                continue;
+
+            byte[] bytes;
+            try { bytes = File.ReadAllBytes(path); }
+            catch (IOException) { continue; }
+
+            // Only convert a raw ELF; an already-signed SELF (or non-ELF payload) is left as-is.
+            if (!LibProsperoPkg.Content.ProsperoFself.IsElf(bytes) || LibProsperoPkg.Content.ProsperoFself.IsSelf(bytes))
+                continue;
+
+            byte[] fself;
+            try
+            {
+                fself = LibProsperoPkg.Content.ProsperoFself.MakeFself(bytes, fselfOptions);
+            }
+            catch (ArgumentException ex)
+            {
+                warnings.Add($"Could not fake-sign {Path.GetFileName(path)}: {ex.Message}");
+                continue;
+            }
+
+            restore.Add((path, bytes));
+            File.WriteAllBytes(path, fself);
+            log($"Fake-signed {Path.GetRelativePath(sourceFolder, path)} ({bytes.Length} -> {fself.Length} bytes).");
+        }
+
+        // Nothing to convert is the normal case for a tree whose modules are already fake-signed, so it
+        // is reported as progress rather than as a warning.
+        if (restore.Count == 0)
+            log("No raw ELF modules to fake-sign; the modules in the source tree are already signed.");
+    }
+
+    // Restores the original module bytes saved by PrepareFakeSelfModules. This runs during recovery, so
+    // every module is attempted even if one restore fails; a failure on one file must not leave the
+    // remaining files fake-signed.
+    private static void RestoreFakeSelfModules(List<(string Path, byte[] Original)> restore, Action<string> log)
+    {
+        foreach (var (path, original) in restore)
+        {
+            try { File.WriteAllBytes(path, original); }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                log($"Warning: could not restore original module '{path}' after fake-signing: {ex.Message}");
+            }
+        }
+    }
+
     private static void EnsureParamJson(
         ProsperoBuildOptions options, string sourceFolder, Action<string> log, List<string> warnings)
     {
@@ -579,7 +767,6 @@ public static class ProsperoPackageBuilder
         Directory.CreateDirectory(sceSys);
         log("sce_sys/param.json not found - generating a minimal one from the supplied metadata.");
         File.WriteAllText(paramPath, BuildMinimalParamJson(options), new UTF8Encoding(false));
-        warnings.Add("A minimal param.json was generated; review it for store-grade packages.");
     }
 
     private static string BuildMinimalParamJson(ProsperoBuildOptions options)
@@ -588,22 +775,25 @@ public static class ProsperoPackageBuilder
         var title = string.IsNullOrWhiteSpace(options.Title) ? titleId : options.Title;
         var version = NormalizeVersion(options.Version);
 
-        var root = new JsonObject
+        var param = new ProsperoParam
         {
-            ["applicationCategoryType"] = CategoryTypeForMode(options.Mode),
-            ["contentId"] = options.ContentId,
-            ["contentVersion"] = version,
-            ["masterVersion"] = version,
-            ["requiredSystemSoftwareVersion"] = "00.00.00.00",
-            ["titleId"] = titleId,
-            ["localizedParameters"] = new JsonObject
-            {
-                ["defaultLanguage"] = "en-US",
-                ["en-US"] = new JsonObject { ["titleName"] = title },
-            },
+            ApplicationCategoryType = CategoryTypeForMode(options.Mode),
+            ApplicationDrmType = options.ApplicationDrmType
+                ?? ProsperoApplicationTypes.ApplicationDrmType(options.ApplicationType),
+            ContentId = options.ContentId,
+            ContentVersion = version,
+            MasterVersion = version,
+            RequiredSystemSoftwareVersion = "0x0000000000000000",
+            SdkVersion = "0x0000000000000000",
+            TitleId = titleId,
         };
+        param.DefaultLanguage = "en-US";
+        param.SetTitleName("en-US", title);
 
-        return root.ToJsonString(new JsonSerializerOptions { WriteIndented = true });
+        if (options.ContentBadgeType is int badge)
+            param.ContentBadgeType = badge;
+
+        return param.ToJson();
     }
 
     private static string ComposePkgFileName(string contentId, string version)

@@ -1,43 +1,40 @@
 // LibProsperoPkg - A library for building and inspecting PS5 packages.
 // Copyright (C) 2026 SvenGDK
 //
-// Producer for the trailing SI (install-metadata) segment of a finalized image, in the
+// Builder for the trailing SI (install-metadata) segment of a finalized image, in the
 // DEBUG variant (FIH signed byte 0x00).
 //
-// Validated format. Decoded byte-for-byte from TestFiles/PS5/PKG/Debug/Downloads.pkg (cross-checked
-// against InternetBrowser.pkg and DebugSettings.pkg): in a debug finalized image the SI segment is
-// a plain ZIP (PK\x03\x04, every member STORED / uncompressed) with this exact member set:
+// In a debug finalized image the SI segment is a plain ZIP (PK\x03\x04, every member STORED /
+// uncompressed) with this exact member set:
 //
 // common/etc/naps_meta_18.dat 3440 B (per-package metric blob)
-// common/etc/naps_meta_300/301/302/308.dat 48 B each, byte-identical
+// common/etc/naps_meta_300/301/302/308.dat 48 B each
 // common/etc/pfsimage.xml rich package-configuration descriptor
 // common/etc/playgo-chunk.dat 416 B copied from the inner PFS
 // config/<content-id>/playgo-chunk.crc 68 B
 //
-// Records and external inputs:
-// * ZIP container framing, STORED entries and the exact member paths -> reproduced.
-// * pfsimage.xml structure (the reference <package-configuration type="package-info"> tree with the
-// "0xNN 0xNN" digest formatting, <config>/<digests>/<params>/<container>/<mount-image>) ->
-// reproduced from values the caller/builder already knows.
-// * playgo-chunk.dat -> reproduced (it is copied verbatim from the inner PFS the builder makes).
-// * naps_meta_300/301/302/308.dat -> reproduced byte-exact by ProsperoNapsMeta.BuildMeta300 (a
-// plaintext 48-byte descriptor derived from the inner-image geometry; validated against three reference
-// debug packages).
+// Records and inputs:
+// * ZIP container framing, STORED entries, and member paths.
+// * pfsimage.xml structure (the <package-configuration type="package-info"> tree with the
+// "0xNN 0xNN" digest formatting, <config>/<digests>/<params>/<container>/<mount-image>)
+//   from values the caller or builder already knows.
+// * playgo-chunk.dat copied verbatim from the inner PFS the builder makes.
+// * naps_meta_300/301/302/308.dat built by ProsperoNapsMeta.BuildMeta300 as a plaintext
+//   48-byte descriptor derived from the inner-image geometry.
 // * Several pfsimage.xml <digests> are reproducible and should be supplied by the builder:
 // game-digest (== inner sblock-digest, SHA3-256 of the plaintext outer superblock), param-digest
 // (SHA3-256 of the param.json CNT entry), body-digest, fixed-info-digest, package-digest
 // (== SHA3-256(CNT[0:0xFE0]), ProsperoImageDigests.ComputePackageDigest, identical to the value the
 // produced CNT stores at +0xFE0), and the full GeneralDigests set — content-digest, header-digest,
 // system-digest, playgo-digest and the target slot (all SHA3-256 of plaintext CNT regions / per-entry
-// digests, ProsperoPkgBuilder.ComputeGeneralDigests, Validated byte-exact against the reference debug
-// packages). When the produced CNT bytes are available, pass these via the corresponding options
+// digests, ProsperoPkgBuilder.ComputeGeneralDigests). When the produced CNT bytes are available, pass
+// these via the corresponding options
 // rather than leaving placeholders.
 // * The remaining members are not reproducible off-console: the distinct FIH 0xB0 slot (a best-effort
 // nested-image-content hash), the keyed/encrypted naps_meta_18.dat metric blob, and the 68-byte
 // playgo-chunk.crc. They are accepted as inputs and emitted verbatim. When a caller does
 // not have them, all-zero placeholders are written for the XML digests and the keyed standalone
 // members are omitted - they are never fabricated.
-// See LibProsperoPKG/docs/implementation-status.md.
 
 using LibProsperoPkg.PFS;
 using LibProsperoPkg.PlayGo;
@@ -47,6 +44,7 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
 using System.IO.Compression;
+using System.Linq;
 using System.Text;
 
 namespace LibProsperoPkg.PKG;
@@ -59,8 +57,7 @@ public readonly record struct ProsperoSiMember(string Path, byte[] Content);
 /// <summary>
 /// One <c>&lt;entry&gt;</c> of the <c>pfsimage.xml</c> <c>&lt;entries&gt;</c> table: a single CNT
 /// (sce_sys) file with its byte offset and size inside the finalized container body. These values
-/// are known to the builder once it has laid out the inner image, so the table is fully
-/// reproducible (unlike the keyed digests).
+/// are known to the builder once it has laid out the inner image.
 /// </summary>
 /// <param name="Name">CNT entry name, e.g. <c>imagedigs.dat</c>.</param>
 /// <param name="Offset">Byte offset of the entry inside the container body.</param>
@@ -78,8 +75,9 @@ public sealed class ProsperoChunkInfoModel
     /// <summary>Size in bytes of the copied <c>playgo-chunk.dat</c> (the <c>size</c> attribute).</summary>
     public int PlayGoChunkDatSize { get; set; }
 
-    /// <summary>SDK version stamp (the <c>sdk</c> attribute), 32-bit hex e.g. <c>0x00000000</c>.</summary>
-    public string Sdk { get; set; } = "0x00000000";
+    /// <summary>SDK version stamp (the <c>sdk</c> attribute), 32-bit hex. Defaults to <c>0x00850000</c> —
+    /// zero is rejected/invalid.</summary>
+    public string Sdk { get; set; } = "0x00850000";
 
     /// <summary>Display flags (the <c>disps</c> attribute); <c>0x0011</c> for a single-chunk nwonly image.</summary>
     public string Disps { get; set; } = "0x0011";
@@ -105,7 +103,7 @@ public sealed class ProsperoChunkInfoModel
 /// </summary>
 public sealed class ProsperoPfsImageXmlOptions
 {
-    /// <summary>Content id, e.g. <c>IV9999-NPXS41139_00-XXXXXXXXXXXXXXXX</c>.</summary>
+    /// <summary>Content id, e.g. <c>IV0000-NPXS00000_00-XXXXXXXXXXXXXXXX</c>.</summary>
     public string ContentId { get; set; } = "";
 
     /// <summary>Human-readable title (<c>&lt;titleName&gt;</c> / <c>&lt;chunkinfo&gt;</c>).</summary>
@@ -167,14 +165,14 @@ public sealed class ProsperoPfsImageXmlOptions
     public string SdkVersion { get; set; } = "0x0000000000000000";
 
     /// <summary>
-    /// Toolchain <c>&lt;version-date&gt;</c> stamp. Defaults to the validated
-    /// reference build constant <c>0x20200722</c>.
+    /// Toolchain <c>&lt;version-date&gt;</c> stamp. Defaults to the build
+    /// constant <c>0x20200722</c>.
     /// </summary>
     public uint VersionDate { get; set; } = 0x20200722;
 
     /// <summary>
-    /// Toolchain <c>&lt;version-hash&gt;</c> stamp. Defaults to the validated
-    /// reference build constant <c>0x01fe52e9</c>.
+    /// Toolchain <c>&lt;version-hash&gt;</c> stamp. Defaults to the build
+    /// constant <c>0x01fe52e9</c>.
     /// </summary>
     public uint VersionHash { get; set; } = 0x01fe52e9;
 
@@ -192,8 +190,8 @@ public sealed class ProsperoPfsImageXmlOptions
 
     /// <summary>
     /// The CNT (sce_sys) entry table for the <c>&lt;entries&gt;</c> section. When non-empty the table
-    /// is emitted exactly as the tool does (<c>num</c> attribute plus one <c>&lt;entry&gt;</c> per file);
-    /// when empty the section is omitted.
+    /// is emitted with a <c>num</c> attribute plus one <c>&lt;entry&gt;</c> per file; when empty the
+    /// section is omitted.
     /// </summary>
     public IReadOnlyList<ProsperoPfsImageEntry> Entries { get; set; } = [];
 
@@ -240,6 +238,14 @@ public sealed class ProsperoPfsImageXmlOptions
     public ProsperoPfsImageTreeInfo? NestedPfsTree { get; set; }
 
     /// <summary>
+    /// The assembled nwonly inner-image result. When set, the <c>&lt;nested-image&gt;</c> section is
+    /// emitted from the reconstructed inner mount (correct 0x4a0000 mount geometry, metadata line,
+    /// flat-path tables, per-node physical offsets, afids and imodes) instead of the outer-PFS
+    /// snapshot in <see cref="NestedPfsTree"/>. Takes precedence over <see cref="NestedPfsTree"/>.
+    /// </summary>
+    public LibProsperoPkg.PFS.ProsperoPs5InnerImageResult? NestedInner { get; set; }
+
+    /// <summary>
     /// PlayGo chunk layout for the <c>&lt;chunkinfo&gt;</c> section. When set, the section is emitted
     /// from our own package geometry; when <see langword="null"/> the section is omitted.
     /// </summary>
@@ -247,11 +253,10 @@ public sealed class ProsperoPfsImageXmlOptions
 }
 
 /// <summary>
-/// Writes the <b>debug</b>-variant SI install-metadata segment as the reference ZIP container decoded
-/// from the reference debug packages. The container, member paths, the <c>pfsimage.xml</c> structure
-/// (reproduced byte-for-byte through its config/digests/params/container/mount-image/entries
-/// sections) and
-/// the copied <c>playgo-chunk.dat</c> are reproduced exactly; keyed members are supplied by the
+/// Writes the <b>debug</b>-variant SI install-metadata segment as a ZIP container. The container,
+/// member paths, the <c>pfsimage.xml</c> structure (its config/digests/params/container/
+/// mount-image/entries sections) and
+/// the copied <c>playgo-chunk.dat</c> are written directly; keyed members are supplied by the
 /// caller and emitted verbatim - never fabricated. The retail-variant SI is console-encrypted and
 /// is not handled (see the file header).
 /// </summary>
@@ -264,7 +269,7 @@ public static class ProsperoSiArchive
     /// <summary>Canonical member path for the 3440-byte metric blob.</summary>
     public const string NapsMeta18Path = "common/etc/naps_meta_18.dat";
 
-    /// <summary>The four byte-identical 48-byte <c>naps_meta_*</c> record ids, in file order.</summary>
+    /// <summary>The four 48-byte <c>naps_meta_*</c> record ids, in file order.</summary>
     public static ReadOnlySpan<int> NapsMeta300Ids => [300, 301, 302, 308];
 
     /// <summary>
@@ -290,14 +295,14 @@ public static class ProsperoSiArchive
 
         // When the caller passes the finalized mount image but not an explicit CRC blob, compute
         // playgo-chunk.crc reproducibly (CRC-32C of each 64KiB block). An explicitly supplied blob
-        // always wins so verbatim keyed/sample inputs are preserved.
+        // always wins so supplied keyed inputs are preserved.
         playGoChunkCrc ??= finalizedMountImage is { Length: > 0 }
             ? ProsperoPlayGo.BuildChunkCrc(finalizedMountImage)
             : null;
 
         var members = new List<ProsperoSiMember>();
 
-        // The reference member order in Downloads.pkg is naps_meta_* first, then pfsimage.xml, then
+        // The member order is naps_meta_* first, then pfsimage.xml, then
         // playgo-chunk.dat, then the per-content-id playgo-chunk.crc.
         if (napsMeta18 is not null)
             members.Add(new(NapsMeta18Path, napsMeta18));
@@ -327,7 +332,7 @@ public static class ProsperoSiArchive
     /// <list type="bullet">
     ///   <item><c>common/etc/pfsimage.xml</c> from <paramref name="pfsImageXml"/> (real self-consistent
     ///   digests, entries and geometry).</item>
-    ///   <item><c>common/etc/naps_meta_300/301/302/308.dat</c> derived byte-exact from the finalized-image
+    ///   <item><c>common/etc/naps_meta_300/301/302/308.dat</c> derived from the finalized-image
     ///   inner-image size at FIH offset <see cref="ProsperoPkgLayout.FihInnerImageSizeField"/> via
     ///   <see cref="ProsperoNapsMeta.BuildMeta300FromInnerImageSize"/>.</item>
     ///   <item><c>common/etc/playgo-chunk.dat</c> copied verbatim from <paramref name="playGoChunkDat"/>
@@ -335,8 +340,8 @@ public static class ProsperoSiArchive
     ///   <item><c>config/&lt;content-id&gt;/playgo-chunk.crc</c> computed by CRC-32C over the finalized
     ///   mount image.</item>
     /// </list>
-    /// The keyed/encrypted <c>naps_meta_18.dat</c> metric blob has no off-console producer and is never
-    /// fabricated — it is omitted.
+    /// The <c>naps_meta_18.dat</c> metric blob is built by <see cref="ProsperoNapsMeta.BuildMeta18"/> from
+    /// the finalized image and its content-file set (AES-128-XTS TLV) when the inner-image size is known.
     /// </summary>
     /// <param name="pfsImageXml">Fully-populated reproducible pfsimage.xml options from the builder.</param>
     /// <param name="playGoChunkDat">CNT PlayGo chunk descriptor bytes (entry 0x1001), or null.</param>
@@ -345,7 +350,7 @@ public static class ProsperoSiArchive
     /// Block-aligned stored size of the inner <c>pfs_image.dat</c> (the FIH-0xA0 value), captured by the
     /// builder. When positive it drives the <c>naps_meta_300</c> record directly. When 0 (e.g. a standalone
     /// caller with only the finalized image) it falls back to reading FIH[0xA0] out of <paramref name="mountImage"/>,
-    /// which is only populated for the reference data-first layout.
+    /// which is only populated for the data-first layout.
     /// </param>
     /// <param name="warnings">Optional sink for any all-zero-placeholder notices from the XML builder.</param>
     public static byte[] BuildDebugSiSegment(
@@ -357,8 +362,8 @@ public static class ProsperoSiArchive
 
         // naps_meta_300 R = InnerImageSize - 0x10000 (block-aligned inner-image size minus one FIH block).
         // Prefer the builder-captured InnerImageSize; when it is not supplied (standalone callers), read
-        // FIH[0xA0] out of the mount image, which is only populated for the reference data-first layout.
-        // Below one block the record cannot be derived, so it is simply omitted (never faked).
+        // FIH[0xA0] out of the mount image, which is only populated for the data-first layout.
+        // Below one block the record cannot be derived, so it is omitted (never faked).
         byte[]? napsMeta300 = null;
         ulong innerSize = innerImageSize > 0 ? (ulong)innerImageSize : 0;
         if (innerSize == 0)
@@ -370,13 +375,40 @@ public static class ProsperoSiArchive
         if (innerSize >= ProsperoNapsMeta.PfsBlockSize)
             napsMeta300 = ProsperoNapsMeta.BuildMeta300FromInnerImageSize(innerSize);
 
+        // naps_meta_18: AES-128-XTS TLV metric blob over the finalized image and its content-file set.
+        byte[]? napsMeta18 = null;
+        if (innerSize >= ProsperoNapsMeta.PfsBlockSize && mountImage.Length >= 0x10000)
+        {
+            var contentFiles = CollectContentFiles(pfsImageXml.NestedPfsTree);
+            // Data-first path: NestedPfsTree is null (only NestedInner is set), so the tree walk above yields
+            // an empty list and naps_meta_18's file/fstr table would be empty — which makes the installer sum
+            // a zero content size and reject the package at the geometry gate (0x80b21185). Recover the
+            // content files from the assembled inner image instead.
+            if (contentFiles.Count == 0 && pfsImageXml.NestedInner is { } nestedInner)
+            {
+                var innerFiles = CollectContentFilesFromInner(nestedInner).ToList();
+                // The file table ends with a "*PFSmetadata" pseudo-entry sized to the outer PFS image region
+                // (PfsImageSize = the block-aligned mount-image the installer pre-allocates as the PlayGo
+                // Chunk). The geometry gate reads that region size as package_size; without this entry the
+                // sum is 0 / unaligned and the install fails.
+                innerFiles.Add(("*PFSmetadata", pfsImageXml.PfsImageSize));
+                contentFiles = innerFiles;
+            }
+            // On the nwonly path pass the assembled inner image so BuildMeta18 emits ibcl/i2ob/i2op/ihsh
+            // and the *PFSmetadata file record over the compressed inner-image NAPS block map (the fix for
+            // the 0x80b21185 geometry gate). Legacy inners pass null and keep the outer-block behavior.
+            byte[] blob = ProsperoNapsMeta.BuildMeta18(innerSize, mountImage, contentFiles, pfsImageXml.NestedInner);
+            if (blob.Length > 0)
+                napsMeta18 = blob;
+        }
+
         byte[] xmlBytes = Encoding.UTF8.GetBytes(BuildPfsImageXml(pfsImageXml, warnings));
 
         IReadOnlyList<ProsperoSiMember> members = BuildMembers(
             pfsImageXml.ContentId,
             xmlBytes,
             playGoChunkDat: playGoChunkDat,
-            napsMeta18: null,                 // keyed per-package metric blob — never fabricated.
+            napsMeta18: napsMeta18,
             napsMeta300: napsMeta300,
             playGoChunkCrc: null,
             finalizedMountImage: mountImage); // computes playgo-chunk.crc reproducibly (CRC-32C).
@@ -385,23 +417,159 @@ public static class ProsperoSiArchive
     }
 
     /// <summary>
+    /// Flattens a nested-image file tree into the content-file list (relative path, plain size) the
+    /// <c>naps_meta_18</c> file/fstr records enumerate. Directories are skipped; files are returned in
+    /// depth-first pre-order.
+    /// </summary>
+    private static IReadOnlyList<(string Path, long Size)> CollectContentFiles(ProsperoPfsImageTreeInfo? tree)
+    {
+        var files = new List<(string, long)>();
+        if (tree?.Root is { } root)
+            WalkContentFiles(root, "", files);
+        return files;
+    }
+
+    private static void WalkContentFiles(ProsperoPfsImageNode node, string prefix, List<(string, long)> files)
+    {
+        foreach (ProsperoPfsImageNode child in node.Children)
+        {
+            string path = prefix.Length == 0 ? child.Name : $"{prefix}/{child.Name}";
+            if (child.IsDirectory)
+                WalkContentFiles(child, path, files);
+            else
+                files.Add((path, child.PlainSize));
+        }
+    }
+
+    /// <summary>
+    /// Enumerates the content files of a nwonly image straight from the assembled inner-image node list
+    /// (used when <see cref="ProsperoPfsImageXmlOptions.NestedPfsTree"/> is null). Real content files carry
+    /// <c>ParentInode &gt;= 0</c>; the super-root's flat-path tables (<c>ParentInode == -1</c>) are internal
+    /// and excluded. Ordered by afid so the <c>naps_meta_18</c> file/fstr records follow the per-file index
+    /// the mount assigns; each node's <c>FullPath</c> (e.g. <c>/sce_sys/keystone</c>) is made root-relative.
+    /// </summary>
+    private static IReadOnlyList<(string Path, long Size)> CollectContentFilesFromInner(
+        LibProsperoPkg.PFS.ProsperoPs5InnerImageResult inner)
+    {
+        var byInode = new Dictionary<uint, LibProsperoPkg.PFS.ProsperoPs5MetaNode>();
+        foreach (var node in inner.Nodes)
+            byInode[node.Inode] = node;
+
+        // Reconstruct the uroot-relative path of a content file: walk up parent inodes prepending each
+        // directory name, stopping when the parent is the mount root (uroot) — a super-root direct child
+        // with ParentInode == -1. (The node's FullPath field is not populated on the nwonly path.)
+        string PathOf(LibProsperoPkg.PFS.ProsperoPs5MetaNode file)
+        {
+            var parts = new List<string> { file.Name };
+            var cur = file;
+            while (cur.ParentInode >= 0 && byInode.TryGetValue((uint)cur.ParentInode, out var parent))
+            {
+                if (parent.ParentInode == -1) break;
+                parts.Insert(0, parent.Name);
+                cur = parent;
+            }
+            return string.Join('/', parts);
+        }
+
+        return inner.Nodes
+            .Where(n => !n.IsDirectory && n.ParentInode >= 0)
+            .OrderBy(n => n.Afid)
+            .Select(n => (Path: PathOf(n), Size: n.Size))
+            .ToList();
+    }
+
+    /// <summary>
     /// Serialises <paramref name="members"/> into a ZIP using <see cref="CompressionLevel.NoCompression"/>
-    /// (the reference SI uses STORED entries) and returns the raw segment bytes.
+    /// (the SI uses STORED entries) and returns the raw segment bytes.
     /// </summary>
     public static byte[] WriteZip(IReadOnlyList<ProsperoSiMember> members)
     {
         ArgumentNullException.ThrowIfNull(members);
+
+        // Custom minimal ZIP writer that produces the exact SI framing the SI walker requires (all members
+        // STORED, no extra fields, central-directory "version made by" = 0, deterministic DOS date/time).
+        // .NET's ZipArchive emits `version made by` = 0x0014 and its own timestamps, which diverge from
+        // the required SI ZIP layout; the console's SI walker depends on these exact fields, so this writer
+        // emits the layout field-for-field. Paths use forward slashes and the exact member set/order the caller gives.
+        const ushort VersionNeeded = 20;   // 2.0 (STORED)
+        const ushort DosTime = 0;          // deterministic; the walker does not inspect the timestamp.
+        const ushort DosDate = 0x0021;     // 1980-01-01 (minimal valid DOS date).
+
         using var ms = new MemoryStream();
-        using (var zip = new ZipArchive(ms, ZipArchiveMode.Create, leaveOpen: true))
+        using var w = new BinaryWriter(ms, Encoding.ASCII, leaveOpen: true);
+        var local = new (uint Crc, int Size, int NameLen, long Offset)[members.Count];
+
+        for (int i = 0; i < members.Count; i++)
         {
-            foreach (ProsperoSiMember m in members)
-            {
-                ZipArchiveEntry entry = zip.CreateEntry(m.Path, CompressionLevel.NoCompression);
-                using Stream es = entry.Open();
-                es.Write(m.Content, 0, m.Content.Length);
-            }
+            ProsperoSiMember m = members[i];
+            byte[] name = Encoding.ASCII.GetBytes(m.Path);
+            uint crc = ZipCrc32(m.Content);
+            long off = ms.Position;
+            local[i] = (crc, m.Content.Length, name.Length, off);
+
+            w.Write((uint)0x04034b50);          // local file header signature
+            w.Write(VersionNeeded);
+            w.Write((ushort)0);                 // general purpose flag
+            w.Write((ushort)0);                 // method = stored
+            w.Write(DosTime);
+            w.Write(DosDate);
+            w.Write(crc);
+            w.Write((uint)m.Content.Length);    // compressed size (== uncompressed for STORED)
+            w.Write((uint)m.Content.Length);    // uncompressed size
+            w.Write((ushort)name.Length);
+            w.Write((ushort)0);                 // extra field length
+            w.Write(name);
+            w.Write(m.Content);
         }
+
+        long cdStart = ms.Position;
+        for (int i = 0; i < members.Count; i++)
+        {
+            byte[] name = Encoding.ASCII.GetBytes(members[i].Path);
+            w.Write((uint)0x02014b50);          // central directory header signature
+            w.Write((ushort)0);                 // version made by = 0 (required layout; .NET writes 0x0014)
+            w.Write(VersionNeeded);
+            w.Write((ushort)0);                 // general purpose flag
+            w.Write((ushort)0);                 // method = stored
+            w.Write(DosTime);
+            w.Write(DosDate);
+            w.Write(local[i].Crc);
+            w.Write((uint)local[i].Size);       // compressed size
+            w.Write((uint)local[i].Size);       // uncompressed size
+            w.Write((ushort)name.Length);
+            w.Write((ushort)0);                 // extra field length
+            w.Write((ushort)0);                 // comment length
+            w.Write((ushort)0);                 // disk number start
+            w.Write((ushort)0);                 // internal attributes
+            w.Write((uint)0);                   // external attributes
+            w.Write((uint)local[i].Offset);     // relative offset of local header
+            w.Write(name);
+        }
+        long cdSize = ms.Position - cdStart;
+
+        w.Write((uint)0x06054b50);              // end of central directory signature
+        w.Write((ushort)0);                     // disk number
+        w.Write((ushort)0);                     // disk with central directory
+        w.Write((ushort)members.Count);         // entries on this disk
+        w.Write((ushort)members.Count);         // total entries
+        w.Write((uint)cdSize);
+        w.Write((uint)cdStart);
+        w.Write((ushort)0);                     // comment length
+        w.Flush();
         return ms.ToArray();
+    }
+
+    /// <summary>Standard ZIP CRC-32 (reflected polynomial 0xEDB88320) over <paramref name="data"/>.</summary>
+    private static uint ZipCrc32(ReadOnlySpan<byte> data)
+    {
+        uint crc = 0xFFFFFFFFu;
+        foreach (byte b in data)
+        {
+            crc ^= b;
+            for (int k = 0; k < 8; k++)
+                crc = (crc >> 1) ^ (0xEDB88320u & (uint)(-(int)(crc & 1)));
+        }
+        return crc ^ 0xFFFFFFFFu;
     }
 
     /// <summary>
@@ -421,7 +589,7 @@ public static class ProsperoSiArchive
     }
 
     /// <summary>
-    /// Builds <c>common/etc/pfsimage.xml</c> in the reference format, reproduced byte-for-byte through its
+    /// Builds <c>common/etc/pfsimage.xml</c> in the finalized format through its
     /// <c>&lt;config&gt;</c>, <c>&lt;digests&gt;</c>, <c>&lt;params&gt;</c>, <c>&lt;container&gt;</c>,
     /// <c>&lt;mount-image&gt;</c> and <c>&lt;entries&gt;</c> sections. Keyed
     /// digest fields are emitted verbatim when present on <paramref name="options"/>, otherwise as
@@ -528,7 +696,7 @@ public static class ProsperoSiArchive
                 sb.Append($"    <entry offset=\"{Hex8(e.Offset)}\" size=\"{Hex8(e.Size)}\" name=\"{e.Name}\"/>\n");
             sb.Append("  </entries>\n");
         }
-        AppendStageB(sb, options);
+        AppendIntrospectionSections(sb, options);
         sb.Append("</package-configuration>\n");
         return sb.ToString();
     }
@@ -566,13 +734,15 @@ public static class ProsperoSiArchive
     /// <see cref="ProsperoPfsImageXmlOptions.ChunkInfo"/>, <see cref="ProsperoPfsImageXmlOptions.OuterPfsTree"/>
     /// and <see cref="ProsperoPfsImageXmlOptions.NestedPfsTree"/> are supplied.
     /// </summary>
-    private static void AppendStageB(StringBuilder sb, ProsperoPfsImageXmlOptions options)
+    private static void AppendIntrospectionSections(StringBuilder sb, ProsperoPfsImageXmlOptions options)
     {
         if (options.ChunkInfo is { } chunk)
             AppendChunkInfo(sb, options.ContentId, chunk);
         if (options.OuterPfsTree is { } outer)
             AppendPfsImage(sb, outer, options.PfsImageOffset);
-        if (options.NestedPfsTree is { } nested)
+        if (options.NestedInner is { } innerResult)
+            AppendNestedImageFromInner(sb, innerResult);
+        else if (options.NestedPfsTree is { } nested)
             AppendNestedImage(sb, nested);
     }
 
@@ -624,6 +794,80 @@ public static class ProsperoSiArchive
         sb.Append("  </nested-image>\n");
     }
 
+    // Emits the <nested-image> section from the assembled nwonly inner mount (ProsperoPs5InnerImageAssembler
+    // output). Unlike AppendNestedImage (which described the OUTER pfs tree by mistake), this reflects the
+    // actual reconstructed inner mount: the 0x4a0000 image size, the three flat-path tables, per-directory
+    // physical offsets (poffset = the node's logical mount offset), and per-file on-disk data offsets
+    // (offset = the packed data-region offset), afids and imodes.
+    private static void AppendNestedImageFromInner(StringBuilder sb, ProsperoPs5InnerImageResult inner)
+    {
+        const int BLK = ProsperoPs5InnerMetadata.BlockSize; // 0x10000
+        var nodes = inner.Nodes;
+        long metaBase = inner.MetaBaseLogical;
+
+        // File mount-logical offset -> on-disk (packed data-region) offset for the <file offset="..."> value.
+        var onDiskByLogical = new Dictionary<ulong, long>();
+        foreach (var p in inner.Placements)
+            onDiskByLogical[(ulong)p.LogicalOffset] = p.OnDiskOffset;
+
+        // Group children by parent inode. The super-root and its direct children (the flat-path tables and
+        // uroot) carry ParentInode == -1; nested nodes carry their real parent inode.
+        var childrenOf = new Dictionary<int, List<ProsperoPs5MetaNode>>();
+        ProsperoPs5MetaNode? superRoot = null;
+        foreach (var n in nodes)
+        {
+            if (n.IsDirectory && n.Name.Length == 0) { superRoot = n; continue; }
+            if (!childrenOf.TryGetValue(n.ParentInode, out var list))
+                childrenOf[n.ParentInode] = list = new List<ProsperoPs5MetaNode>();
+            list.Add(n);
+        }
+        if (superRoot is null) { return; }
+
+        int regularFiles = nodes.Count(n => !n.IsDirectory && n.ParentInode != -1);
+        long metaPlain = inner.MetadataPlaintext.Length;
+        long metaComp = inner.CompressedMetadata.Length;
+
+        sb.Append("  <nested-image version=\"2\" readonly=\"true\" offset=\"0\">\n");
+        sb.Append("    <sblock ignore-case=\"true\" index-size=\"32\" blocks=\"1\" backups=\"0\">\n");
+        sb.Append($"      <image-size block-size=\"{BLK}\" num=\"{inner.Ndblock}\">{Hex16Blob(inner.Ndblock * BLK)}</image-size>\n");
+        sb.Append($"      <super-inode blocks=\"1\" inodes=\"{nodes.Count}\" root=\"0\">\n");
+        sb.Append($"        <inode size=\"{BLK}\" links=\"1\" mode=\"0x0000\" imode=\"0x00000010\" index=\"{metaBase / BLK + 1}\"/>\n");
+        sb.Append("      </super-inode>\n");
+        sb.Append("    </sblock>\n");
+        sb.Append($"    <metadata size=\"{metaComp}\" plain=\"{metaPlain}\" comp=\"{CompLabel(metaComp, metaPlain, BLK)}\" offset=\"{inner.MetadataOnDiskOffset}\" poffset=\"{metaBase}\" afid=\"{regularFiles + 1}\"/>\n");
+        AppendInnerMountNode(sb, superRoot, childrenOf, onDiskByLogical, "    ");
+        sb.Append("  </nested-image>\n");
+    }
+
+    private static void AppendInnerMountNode(StringBuilder sb, ProsperoPs5MetaNode n,
+        Dictionary<int, List<ProsperoPs5MetaNode>> childrenOf, Dictionary<ulong, long> onDiskByLogical, string pad)
+    {
+        const int BLK = ProsperoPs5InnerMetadata.BlockSize;
+        string child = pad + "  ";
+        if (n.IsDirectory)
+        {
+            bool isRoot = n.Name.Length == 0;
+            int key = isRoot ? -1 : (int)n.Inode;
+            string tag = isRoot ? "root" : "dir";
+            string mode = isRoot ? "" : $" mode=\"{Mode4(n.Mode)}\"";
+            sb.Append($"{pad}<{tag} plain=\"{BLK}\" poffset=\"{n.LogicalOffset}\" links=\"{n.Nlink}\"{mode} imode=\"{Imode(n.Flags)}\" inode=\"{n.Inode}\" name=\"{n.Name}\">\n");
+            if (childrenOf.TryGetValue(key, out var kids))
+                foreach (var c in kids.OrderBy(c => c.Inode))
+                    AppendInnerMountNode(sb, c, childrenOf, onDiskByLogical, child);
+            sb.Append($"{pad}</{tag}>\n");
+        }
+        else if (n.ParentInode == -1)
+        {
+            // PFS-internal flat-path / afid table (no data-region file, no afid attribute).
+            sb.Append($"{pad}<file plain=\"{n.Size}\" poffset=\"{n.LogicalOffset}\" imode=\"{Imode(n.Flags)}\" inode=\"{n.Inode}\" name=\"{n.Name}\"/>\n");
+        }
+        else
+        {
+            long onDisk = onDiskByLogical.TryGetValue(n.LogicalOffset, out var od) ? od : (long)n.LogicalOffset;
+            sb.Append($"{pad}<file size=\"{n.Size}\" plain=\"{n.Size}\" offset=\"{onDisk}\" mode=\"{Mode4(n.Mode)}\" imode=\"{Imode(n.Flags)}\" inode=\"{n.Inode}\" afid=\"{n.Afid}\" chunk=\"0\" name=\"{n.Name}\"/>\n");
+        }
+    }
+
     private static void AppendSuperInode(StringBuilder sb, ProsperoPfsImageTreeInfo info)
     {
         sb.Append($"      <image-size block-size=\"{info.BlockSize}\" num=\"{info.ImageBlocks}\">{Hex16Blob(info.ImageBlocks * info.BlockSize)}</image-size>\n");
@@ -633,7 +877,7 @@ public static class ProsperoSiArchive
     }
 
     // Outer <pfs-image> tree: block-index oriented, imode only (no per-node mode), matching the
-    // reference <pfs-image><root> convention.
+    // standard <pfs-image><root> convention.
     private static void AppendOuterNode(StringBuilder sb, ProsperoPfsImageNode n, int blockSize, string pad)
     {
         string child = pad + "  ";
@@ -655,7 +899,7 @@ public static class ProsperoSiArchive
     }
 
     // Nested <nested-image> tree: byte-offset oriented, with mode + imode + afid + chunk on user
-    // files, matching the reference <nested-image><root> convention. Physical package offsets
+    // files, matching the standard <nested-image><root> convention. Physical package offsets
     // (poffset) are omitted because they are not stable for our compressed inner image.
     private static void AppendNestedNode(StringBuilder sb, ProsperoPfsImageNode n, int blockSize, ref int afid, string pad)
     {

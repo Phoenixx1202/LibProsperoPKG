@@ -2,11 +2,11 @@
 // Copyright (C) 2026 SvenGDK
 //
 // SELF (signed ELF) container reader and fake-self producer. A PS5 package wraps executable modules as
-// SELF images: an SCE header, a segment table, the original ELF header and program headers, extended
+// SELF images: a container header, a segment table, the original ELF header and program headers, extended
 // info, and plaintext segment data. The debug path builds a fake-self whose per-segment digest and
 // signature areas are zero-filled and whose authority id carries the fake-authority prefix, so a debug
-// console accepts the module without a real signature. The extended-info digest is SHA-256 over the whole
-// input ELF file.
+// console accepts the module without a real signature. The extended-info digest is SHA-256 over the
+// embedded (normalized) module bytes.
 
 #nullable enable
 using System;
@@ -52,7 +52,7 @@ public sealed record SelfSegment(ulong Flags, ulong FileOffset, ulong FileSize, 
 public sealed record SelfExtInfo(ulong AuthorityId, ulong ProgramType, ulong AppVersion, ulong FirmwareVersion, byte[] Digest);
 
 /// <summary>A parsed SELF image.</summary>
-/// <param name="ProgramType">SCE header program/key type field.</param>
+/// <param name="ProgramType">Container header program/key type field.</param>
 /// <param name="HeaderSize">Size of the header region.</param>
 /// <param name="MetaSize">Size of the metadata footer.</param>
 /// <param name="FileSize">Total file size recorded in the header.</param>
@@ -78,9 +78,18 @@ public sealed class FselfOptions
     public ulong FirmwareVersion { get; init; }
 
     /// <summary>
-    /// Overrides the authority id. When null, the id is derived from the ELF type and the ex-info byte.
+    /// Overrides the authority id. When null, the fake-authority id is written.
     /// </summary>
     public ulong? AuthorityId { get; init; }
+
+    /// <summary>
+    /// Normalizes the ELF header before building (machine to x86-64, a System V / GNU OS/ABI to
+    /// FreeBSD, a placeholder type to executable) so a plain homebrew ELF is accepted as a module.
+    /// Only the 0x40-byte header changes; the container embeds and digests that normalized module,
+    /// so the extended-info digest stays self-consistent. A module whose header is already correct
+    /// is left unchanged. Defaults to <see langword="true"/>.
+    /// </summary>
+    public bool NormalizeHeader { get; init; } = true;
 }
 
 /// <summary>
@@ -89,7 +98,7 @@ public sealed class FselfOptions
 /// <remarks>
 /// Layout (little-endian scalars):
 /// <list type="bullet">
-/// <item>SCE header, 0x20 bytes: magic <c>0x1D3D154F</c>, version/mode/endian/attr bytes, program type,
+/// <item>Container header, 0x20 bytes: magic <c>0xEEF51454</c>, version/mode/endian/attr bytes, program type,
 /// header size, metadata size, file size, segment count, flags.</item>
 /// <item>Segment table at 0x20, one 0x20-byte entry per segment: flags, file offset, file size, memory
 /// size. Content segments come in pairs (a zero-filled digest segment then the data segment).</item>
@@ -101,10 +110,10 @@ public sealed class FselfOptions
 /// </remarks>
 public static class ProsperoFself
 {
-    /// <summary>SCE header magic at file offset 0x00.</summary>
-    public const uint Magic = 0x1D3D154F;
+    /// <summary>Container header magic at file offset 0x00.</summary>
+    public const uint Magic = 0xEEF51454;
 
-    private const int SceHeaderSize = 0x20;
+    private const int ContainerHeaderSize = 0x20;
     private const int SegEntrySize = 0x20;
     private const int ExtInfoSize = 0x40;
     private const int ControlRegionSize = 0x30;
@@ -113,21 +122,18 @@ public static class ProsperoFself
     private const int FooterMarkerOffset = 0x3F0;
     private const uint DefaultProgramType = 0x00000101;
 
-    // Fake-authority ids selected by the ex-info byte at ELF offset 0x3f00, split by executable type.
-    private const ulong PaidExec = 0x3100000000000001;
-    private const ulong PaidDynamic = 0x3100000000000002;
-    private const ulong PaidExecA = 0x3100000000001101;
-    private const ulong PaidDynamicA = 0x3100000000001102;
-    private const ulong PaidExecB = 0x3100000000001001;
-    private const ulong PaidDynamicB = 0x3100000000001002;
+    /// <summary>
+    /// Program authority id (PAID) a fake-self carries. One value covers an executable and a library
+    /// alike; it does not vary with the module type.
+    /// </summary>
+    public const ulong FakeAuthorityId = 0x3100000000000002;
 
     private const int ElfHeaderSize = 0x40;
     private const int ElfPhdrSize = 0x38;
-    private const int ExInfoByteOffset = 0x3F00;
 
-    /// <summary>Returns whether the buffer begins with an SCE/SELF header.</summary>
+    /// <summary>Returns whether the buffer begins with a SELF container header.</summary>
     public static bool IsSelf(ReadOnlySpan<byte> data) =>
-        data.Length >= SceHeaderSize && BinaryPrimitives.ReadUInt32LittleEndian(data) == Magic;
+        data.Length >= ContainerHeaderSize && BinaryPrimitives.ReadUInt32LittleEndian(data) == Magic;
 
     /// <summary>Returns whether the buffer begins with an ELF header.</summary>
     public static bool IsElf(ReadOnlySpan<byte> data) =>
@@ -149,7 +155,7 @@ public static class ProsperoFself
         var segments = new List<SelfSegment>(segCount);
         for (int i = 0; i < segCount; i++)
         {
-            int e = SceHeaderSize + i * SegEntrySize;
+            int e = ContainerHeaderSize + i * SegEntrySize;
             segments.Add(new SelfSegment(
                 BinaryPrimitives.ReadUInt64LittleEndian(data[e..]),
                 BinaryPrimitives.ReadUInt64LittleEndian(data[(e + 0x08)..]),
@@ -157,7 +163,7 @@ public static class ProsperoFself
                 BinaryPrimitives.ReadUInt64LittleEndian(data[(e + 0x18)..])));
         }
 
-        int elfStart = SceHeaderSize + segCount * SegEntrySize;
+        int elfStart = ContainerHeaderSize + segCount * SegEntrySize;
         SelfExtInfo? extInfo = null;
         byte[] elf = Array.Empty<byte>();
         if (IsElf(data[elfStart..]))
@@ -183,15 +189,15 @@ public static class ProsperoFself
         return new SelfImage(programType, headerSize, metaSize, fileSize, segments, elf, extInfo);
     }
 
-    /// <summary>Validates the SCE header and segment table of a SELF image.</summary>
+    /// <summary>Validates the container header and segment table of a SELF image.</summary>
     public static bool Validate(ReadOnlySpan<byte> data, out string? error)
     {
-        if (data.Length < SceHeaderSize) { error = "Buffer is smaller than an SCE header."; return false; }
-        if (BinaryPrimitives.ReadUInt32LittleEndian(data) != Magic) { error = "Bad SCE magic."; return false; }
+        if (data.Length < ContainerHeaderSize) { error = "Buffer is smaller than the container header."; return false; }
+        if (BinaryPrimitives.ReadUInt32LittleEndian(data) != Magic) { error = "Bad container magic."; return false; }
 
         int headerSize = BinaryPrimitives.ReadUInt16LittleEndian(data[0x0C..]);
         int segCount = BinaryPrimitives.ReadUInt16LittleEndian(data[0x18..]);
-        long tableEnd = SceHeaderSize + (long)segCount * SegEntrySize;
+        long tableEnd = ContainerHeaderSize + (long)segCount * SegEntrySize;
         if (tableEnd > data.Length) { error = "Segment table overruns the buffer."; return false; }
         if (headerSize > data.Length) { error = "Header size exceeds the buffer."; return false; }
         error = null;
@@ -211,6 +217,14 @@ public static class ProsperoFself
         if (elf[4] != 2)
             throw new ArgumentException("Only 64-bit ELF modules are supported.", nameof(elf));
 
+        // Normalize the header on a private copy so the caller's buffer is never mutated; the
+        // container then embeds and digests this normalized module.
+        if (options.NormalizeHeader)
+        {
+            elf = (byte[])elf.Clone();
+            ProsperoElfHeader.NormalizeForModule(elf);
+        }
+
         ushort eType = BinaryPrimitives.ReadUInt16LittleEndian(elf.AsSpan(0x10));
         int phoff = (int)BinaryPrimitives.ReadUInt64LittleEndian(elf.AsSpan(0x20));
         int phentSize = BinaryPrimitives.ReadUInt16LittleEndian(elf.AsSpan(0x36));
@@ -219,18 +233,35 @@ public static class ProsperoFself
             throw new ArgumentException($"Unexpected ELF program-header size {phentSize}.", nameof(elf));
         if (phoff + phnum * ElfPhdrSize > elf.Length)
             throw new ArgumentException("ELF program headers overrun the file.", nameof(elf));
+        // The header region embeds the ELF header and its program headers as one contiguous block, so
+        // the program-header table must directly follow the 0x40-byte ELF header. Reject any other
+        // layout rather than embed the wrong bytes.
+        if (phoff != ElfHeaderSize)
+            throw new ArgumentException(
+                $"The ELF program-header table must follow the ELF header at 0x{ElfHeaderSize:X} (e_phoff is 0x{phoff:X}).",
+                nameof(elf));
 
         var selected = SelectSegments(elf, phoff, phnum);
         if (selected.Count == 0)
             throw new ArgumentException("The ELF has no loadable segment content.", nameof(elf));
 
         int segCount = selected.Count * 2;
-        int afterSeg = SceHeaderSize + segCount * SegEntrySize;
+        int afterSeg = ContainerHeaderSize + segCount * SegEntrySize;
         int elfHdrLen = ElfHeaderSize + phnum * ElfPhdrSize;
         int extInfoStart = AlignUp(afterSeg + elfHdrLen, 0x10);
         int headerSize = extInfoStart + ExtInfoSize + ControlRegionSize;
-        int metaSize = MetaFooterBase + (segCount + 4) * 0x40;
+        // One 0x40-byte block per segment plus the fixed group that closes the footer out. Both this and
+        // the header size are matched against containers a console accepts.
+        int metaSize = MetaFooterBase + (segCount + 8) * 0x40;
         int dataStart = headerSize + metaSize;
+
+        // The container header stores headerSize and metaSize as u16 fields (0x0C / 0x0E). A module
+        // with enough program headers to overflow them cannot be represented; fail rather than
+        // silently truncate the sizes.
+        if (headerSize > ushort.MaxValue || metaSize > ushort.MaxValue)
+            throw new ArgumentException(
+                $"The ELF has too many segments to fake-sign (header 0x{headerSize:X}, meta 0x{metaSize:X} exceed the 16-bit container fields).",
+                nameof(elf));
 
         // Assign segment file offsets: a 0x20 digest segment then the data (padded to 16) per pair.
         var segOffsets = new int[segCount];
@@ -261,8 +292,8 @@ public static class ProsperoFself
 
         for (int k = 0; k < selected.Count; k++)
         {
-            int digestEntry = SceHeaderSize + (k * 2) * SegEntrySize;
-            int dataEntry = SceHeaderSize + (k * 2 + 1) * SegEntrySize;
+            int digestEntry = ContainerHeaderSize + (k * 2) * SegEntrySize;
+            int dataEntry = ContainerHeaderSize + (k * 2 + 1) * SegEntrySize;
             int dataTableIndex = k * 2 + 1;
 
             ulong digestFlags = ((ulong)dataTableIndex << 20) | 0x10004;
@@ -275,7 +306,7 @@ public static class ProsperoFself
 
         elf.AsSpan(0, elfHdrLen).CopyTo(span[afterSeg..]);
 
-        ulong authorityId = options.AuthorityId ?? DeriveAuthorityId(elf, eType);
+        ulong authorityId = options.AuthorityId ?? FakeAuthorityId;
         BinaryPrimitives.WriteUInt64LittleEndian(span[extInfoStart..], authorityId);
         BinaryPrimitives.WriteUInt64LittleEndian(span[(extInfoStart + 0x08)..], 1); // program type
         BinaryPrimitives.WriteUInt64LittleEndian(span[(extInfoStart + 0x10)..], options.AppVersion);
@@ -317,18 +348,6 @@ public static class ProsperoFself
                 result.Add(new SelectedSegment(i, (int)off, (int)fsz));
         }
         return result;
-    }
-
-    private static ulong DeriveAuthorityId(byte[] elf, ushort eType)
-    {
-        bool exec = eType == 0x02 || eType == 0xFE00 || eType == 0xFE10;
-        byte ex = ExInfoByteOffset < elf.Length ? elf[ExInfoByteOffset] : (byte)0;
-        return ex switch
-        {
-            0x40 => exec ? PaidExecA : PaidDynamicA,
-            0x80 => exec ? PaidExecB : PaidDynamicB,
-            _ => exec ? PaidExec : PaidDynamic,
-        };
     }
 
     private static void WriteSegment(Span<byte> span, int entry, ulong flags, ulong offset, ulong fileSize, ulong memSize)

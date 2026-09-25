@@ -1,10 +1,8 @@
 // LibProsperoPkg - A library for building and inspecting PS5 packages.
 // Copyright (C) 2026 SvenGDK
 //
-// Generators for the PS5 PlayGo / about helper files that the publishing
-// pipeline creates during PKG building (they are not part of the loose input folder): namely
-// sce_sys/about/right.sprx, sce_sys/playgo-chunk.dat and sce_sys/playgo-manifest.xml. These
-// generators ensure the produced inner PFS carries the full expected file set.
+// Generators for the PS5 PlayGo / about helper files added during PKG building. These generators
+// ensure the produced inner PFS carries the full expected file set.
 //
 // The PS5 PlayGo "chunk" file uses the 'plgx' container (version 0x1000). For the single-image / single-chunk /
 // single-scenario system-application profile that these system packages use, every byte is
@@ -22,8 +20,8 @@ using System.Text;
 namespace LibProsperoPkg.PlayGo;
 
 /// <summary>
-/// Generators for the PS5 PlayGo / "about" files produced by the publishing
-/// pipeline. See the file header for the layouts and the boundary.
+/// Generators for the PS5 PlayGo / "about" files added during PKG building. See the file header
+/// for the layouts and the boundary.
 /// </summary>
 public static class ProsperoPlayGo
 {
@@ -41,12 +39,11 @@ public static class ProsperoPlayGo
     /// <summary>
     /// Builds the PS5 <c>sce_suppl/config/&lt;content-id&gt;/playgo-chunk.crc</c> by reducing the
     /// finalized mount image with CRC-32C (Castagnoli) in 64KiB blocks and serialising each block's
-    /// checksum as a little-endian uint32, in block order. This reproduces the reference
-    /// output byte-for-byte (validated against every debug sample in
-    /// TestFiles/PS5/PKG/Debug). The <paramref name="finalizedMountImage"/> is the FIH+PFS+SC region
-    /// that precedes the SI segment (i.e. everything from offset 0 up to the SI archive); a reference
+    /// checksum as a little-endian uint32, in block order. The <paramref name="finalizedMountImage"/>
+    /// is the FIH+PFS+SC region that precedes the SI segment (i.e. everything from offset 0 up to the
+    /// SI archive); a finalized
     /// mount image is always a whole number of 64KiB blocks, but a trailing partial block (if any)
-    /// is reduced over its actual length for robustness.
+    /// is reduced over its actual length.
     /// </summary>
     /// <param name="finalizedMountImage">The finalized mount image bytes (FIH header + PFS image + embedded CNT).</param>
     /// <returns>The <c>playgo-chunk.crc</c> payload: 4 bytes per 64KiB block.</returns>
@@ -72,15 +69,14 @@ public static class ProsperoPlayGo
     /// single-image / single-chunk / single-scenario profile used by PS5 system applications.
     /// </summary>
     /// <param name="contentId">The 36-character content id stamped at offset 0x40.</param>
-    /// <param name="chunkDataSize">
-    /// The size of chunk #0's primary manifest-chunk (mchunk) region (word at 0x148). When unknown,
-    /// the inner PFS image size is a principled value.
+    /// <param name="mchunk0Size">
+    /// Size of the first mchunk region (word at 0x148), covering the block-aligned inner image.
     /// </param>
-    /// <param name="chunkTailSize">
-    /// The size of chunk #0's secondary mchunk region (word at 0x158). When unknown, pass 0.
+    /// <param name="mchunk1Size">
+    /// Size of the second mchunk region (word at 0x158), covering the remainder of the mount image.
     /// </param>
     /// <returns>The 416-byte <c>playgo-chunk.dat</c> payload.</returns>
-    public static byte[] BuildChunkDat(string contentId, ulong chunkDataSize = 0, ulong chunkTailSize = 0)
+    public static byte[] BuildChunkDat(string contentId, ulong mchunk0Size = 0, ulong mchunk1Size = 0)
     {
         ArgumentException.ThrowIfNullOrEmpty(contentId);
         if (contentId.Length != 36)
@@ -101,7 +97,7 @@ public static class ProsperoPlayGo
         BinaryPrimitives.WriteUInt16LittleEndian(s[0x14..], 0);      // default_scenario_id
         BinaryPrimitives.WriteUInt16LittleEndian(s[0x16..], 1);      // attrib
         BinaryPrimitives.WriteUInt32LittleEndian(s[0x18..], 0);      // sdk_ver
-        // 0x1C .. 0x40: fixed preamble decoded from the reference samples.
+        // 0x1C .. 0x40: fixed preamble.
         s[0x1E] = 0x85;                                             // layer/flags constant
         s[0x20] = 0x02;
         s[0x24] = 0x01;
@@ -135,12 +131,14 @@ public static class ProsperoPlayGo
         // ---- chunk_labels (0x130). ----
         Encoding.ASCII.GetBytes("Chunk #0").CopyTo(s[0x130..]);
 
-        // ---- mchunk_attrs (0x140): two 16-byte {offset, size} entries. ----
-        // entry0 = {0, chunkDataSize}; entry1 = {chunkDataSize, chunkTailSize}.
+        // ---- mchunk_attrs (0x140): two 16-byte {offset, size} entries that tile the mount
+        // image [0, cnt_offset) = FIH header block + PFS image. entry0 = {0, mchunk0Size};
+        // entry1 = {mchunk0Size, mchunk1Size}. Both sizes are non-zero and sum to the mount
+        // image length; the chunk at 0x100 references mchunk index 1, so it must be present.
         BinaryPrimitives.WriteUInt64LittleEndian(s[0x140..], 0);
-        BinaryPrimitives.WriteUInt64LittleEndian(s[0x148..], chunkDataSize);
-        BinaryPrimitives.WriteUInt64LittleEndian(s[0x150..], chunkDataSize);
-        BinaryPrimitives.WriteUInt64LittleEndian(s[0x158..], chunkTailSize);
+        BinaryPrimitives.WriteUInt64LittleEndian(s[0x148..], mchunk0Size);
+        BinaryPrimitives.WriteUInt64LittleEndian(s[0x150..], mchunk0Size);
+        BinaryPrimitives.WriteUInt64LittleEndian(s[0x158..], mchunk1Size);
 
         // ---- inner mchunk_attrs (0x160): {0x21, 0} then a constant {1,1} marker at 0x174. ----
         BinaryPrimitives.WriteUInt64LittleEndian(s[0x160..], 0x21);
@@ -155,13 +153,13 @@ public static class ProsperoPlayGo
 
     /// <summary>
     /// Builds the PS5 <c>sce_sys/playgo-ficm.dat</c>. The file is a 16-byte header followed by a
-    /// <paramref name="fileCount"/>-byte per-file array (zero-filled in the reference samples), so its
+    /// <paramref name="fileCount"/>-byte per-file array (zero-filled), so its
     /// total length is <c>16 + fileCount</c>.
     /// </summary>
     /// <param name="fileCount">The PlayGo file/inode count stamped at 0x0C.</param>
     public static byte[] BuildFicm(uint fileCount)
     {
-        // Defensive bound: the per-file array is one byte per file; a reference package has at most a few
+        // Defensive bound: the per-file array is one byte per file; a package has at most a few
         // thousand inodes, so cap well below int.MaxValue to keep the (int) cast and allocation safe.
         if (fileCount > 0x100000)
             throw new ArgumentOutOfRangeException(nameof(fileCount), fileCount, "PlayGo file count is implausibly large.");
@@ -178,12 +176,11 @@ public static class ProsperoPlayGo
     public const int HashTableTableOffset = 0x38;
 
     // The playgo-hash-table.dat payload is content-INDEPENDENT: the 16-byte prefix and every
-    // 8-byte per-chunk table entry are byte-identical across all reference PS5 debug samples
-    // (Downloads, InternetBrowser, DebugSettings), i.e. they are fixed table constants,
+    // 8-byte per-chunk table entry are fixed table constants,
     // not a hash of this package's content. The first five entries below cover the whole observed
     // debug profile (chunk counts 4 and 5); higher counts are extremely unusual for the
-    // single-chunk system-application packages this path targets, and can be extracted in full
-    // from additional reference packages if ever required.
+    // single-chunk system-application packages this path targets, and can be extended if ever
+    // required.
     private static ReadOnlySpan<byte> HashTablePrefix =>
         [0x51, 0x4F, 0xA2, 0x26, 0xAB, 0x8A, 0xCA, 0x92, 0x4D, 0xC4, 0x1B, 0xA4, 0x61, 0xB7, 0xBB, 0x09];
 
@@ -201,7 +198,7 @@ public static class ProsperoPlayGo
     /// 0x28-byte header, a 16-byte constant prefix, then a <paramref name="chunkCount"/>-entry constant
     /// table (8 bytes each), so its total length is <c>0x38 + chunkCount * 8</c>. The number of
     /// hash-table chunks is half the PlayGo file/inode count stamped in <c>playgo-ficm.dat</c>
-    /// (proven across the reference debug samples: ficm 8 -&gt; 4 chunks, ficm 10 -&gt; 5 chunks).
+    /// (ficm 8 -&gt; 4 chunks, ficm 10 -&gt; 5 chunks).
     /// </summary>
     /// <param name="chunkCount">The hash-table chunk count (= <c>ficmFileCount / 2</c>).</param>
     public static byte[] BuildHashTable(uint chunkCount)
@@ -220,8 +217,8 @@ public static class ProsperoPlayGo
         HashTablePrefix.CopyTo(s[0x28..]);                                               // 16-byte const prefix
         for (int i = 0; i < chunkCount; i++)
         {
-            // The observed debug profile baked these constants for chunk indices 0..4; for the rare
-            // higher counts repeat the last known constant (deterministic, self-consistent).
+            // These constants cover chunk indices 0..4; for the rare higher counts repeat the last
+            // known constant (deterministic, self-consistent).
             byte[] entry = HashTableEntries[Math.Min(i, HashTableEntries.Length - 1)];
             entry.CopyTo(s[(HashTableTableOffset + i * HashTableEntrySize)..]);
         }
@@ -232,8 +229,8 @@ public static class ProsperoPlayGo
     public const int HashTableEntrySize = 8;
 
     /// <summary>
-    /// The fixed PS5 debug <c>sce_sys/about/right.sprx</c> module embedded in every reference
-    /// debug package, or <c>null</c> when the embedded resource is unavailable.
+    /// The fixed PS5 debug rights module embedded in every debug package, or <c>null</c> when the
+    /// embedded resource is unavailable.
     /// </summary>
     public static byte[]? GetRightSprx()
     {

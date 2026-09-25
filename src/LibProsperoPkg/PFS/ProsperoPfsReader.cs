@@ -90,10 +90,19 @@ public class ProsperoPfsReader
                 file.SetLength(sz);
                 long pos = 0;
                 var reader = GetView();
-                if (decompress && flags.HasFlag(ProsperoInodeFlags.compressed))
+                // Only PFSC-decode when the payload is actually a PFSC container. The outer-PFS inode
+                // template carries the `compressed` flag even on raw files (e.g. nwonly's
+                // naps_pkg_layout.dat, which is stored raw), so the flag alone is not a reliable signal;
+                // wrapping a raw payload in ProsperoPfscReader would throw "missing PFSC magic".
+                if (decompress && flags.HasFlag(ProsperoInodeFlags.compressed) && size >= 4)
                 {
-                    sz = compressed_size;
-                    reader = new ProsperoPfscReader(reader);
+                    var magic = new byte[4];
+                    reader.Read(0, magic, 0, 4);
+                    if (magic[0] == (byte)'P' && magic[1] == (byte)'F' && magic[2] == (byte)'S' && magic[3] == (byte)'C')
+                    {
+                        sz = compressed_size;
+                        reader = new ProsperoPfscReader(reader);
+                    }
                 }
                 while (sz > 0)
                 {
@@ -119,11 +128,24 @@ public class ProsperoPfsReader
     public ProsperoPfsReader(MemoryMappedViewAccessor r, ulong pfs_flags = 0, byte[] ekpfs = null, byte[] tweak = null, byte[] data = null)
     : this(new MemoryMappedViewAccessor_(r), pfs_flags, ekpfs, tweak, data)
     { }
-    public ProsperoPfsReader(IMemoryReader r, ulong pfs_flags = 0, byte[] ekpfs = null, byte[] tweak = null, byte[] data = null)
+    /// <param name="r">Backing memory reader over the PFS image.</param>
+    /// <param name="pfs_flags">Superblock pfs_flags selecting the crypto scheme (e.g. the newCrypt bit).</param>
+    /// <param name="ekpfs">Image key used to derive the per-image XTS keys, or null for a plaintext image.</param>
+    /// <param name="tweak">Explicit XTS tweak key, or null to derive it from <paramref name="ekpfs"/>.</param>
+    /// <param name="data">Explicit XTS data key, or null to derive it from <paramref name="ekpfs"/>.</param>
+    /// <param name="superblockByteOffset">Byte offset of the superblock within the image. 0 for a normal
+    /// superblock-first PFS; for a PS5 "data-first" outer PFS the superblock sits near the end (block D), so the
+    /// caller passes D*blockSize. Block pointers stay absolute from the image base (offset 0); only the superblock
+    /// and the dinode table (block D+1) are located relative to this offset.</param>
+    /// <param name="skipDecryption">When true, the image is already plaintext (e.g. a data-first outer PFS the
+    /// caller decrypted up-front with the per-block plain/signed XTS scheme), so the reader must NOT re-apply its
+    /// linear XTS even though the superblock's mode still carries the Encrypted flag.</param>
+    public ProsperoPfsReader(IMemoryReader r, ulong pfs_flags = 0, byte[] ekpfs = null, byte[] tweak = null, byte[] data = null,
+        long superblockByteOffset = 0, bool skipDecryption = false)
     {
         reader = r;
         var buf = new byte[0x400];
-        reader.Read(0, buf, 0, 0x400);
+        reader.Read(superblockByteOffset, buf, 0, 0x400);
 
         using (var ms = new MemoryStream(buf))
         {
@@ -154,7 +176,7 @@ public class ProsperoPfsReader
             dinodeReader = ProsperoDinodeD32.ReadFromStream;
             dinodeSize = (int)ProsperoDinodeD32.SizeOf; // 0xA8
         }
-        if (hdr.Mode.HasFlag(ProsperoPfsMode.Encrypted))
+        if (!skipDecryption && hdr.Mode.HasFlag(ProsperoPfsMode.Encrypted))
         {
             const int XtsSectorSize = 0x1000;
             uint XtsStartSector = hdr.BlockSize / XtsSectorSize;
@@ -175,8 +197,9 @@ public class ProsperoPfsReader
         var maxPerSector = hdr.BlockSize / dinodeSize;
         sectorBuf = new byte[hdr.BlockSize];
         sectorStream = new MemoryStream(sectorBuf);
-        // skip over indirect blocks, block signatures are never checked anyway
-        var dinodeStartPos = hdr.BlockSize + (hdr.BlockSize * hdr.InodeBlockSig.IndirectBlocks.Where(b => b > 0).Count());
+        // skip over indirect blocks, block signatures are never checked anyway. For a data-first outer PFS the
+        // superblock is at superblockByteOffset (block D) and its dinode table follows at block D+1.
+        var dinodeStartPos = superblockByteOffset + hdr.BlockSize + (hdr.BlockSize * hdr.InodeBlockSig.IndirectBlocks.Where(b => b > 0).Count());
         for (var i = 0; i < hdr.DinodeBlockCount; i++)
         {
             var position = dinodeStartPos + (hdr.BlockSize * i);
@@ -296,7 +319,6 @@ public class ProsperoPfsReader
                 blockIndexOffset += sigsPerBlock;
             }
             bool contiguous = true;
-            int last = blocks[0] - 1;
             for (int i = 1; i < blocks.Length; i++)
             {
                 if (blocks[i - 1] + 1 != blocks[i])

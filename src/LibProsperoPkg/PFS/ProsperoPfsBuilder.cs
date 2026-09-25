@@ -58,9 +58,9 @@ public class ProsperoPfsBuilder
     /// <summary>
     /// When set before <see cref="WriteImage(Stream)"/>, captures the <c>sce_sys/imagedigs.dat</c>
     /// preimage into <see cref="ImageDigests"/>: one per-block descriptor digest for every
-    /// block of the plaintext signed image, stored from last byte to first. The PS5 image builder
-    /// gathers the signer's per-block HMAC-SHA256 descriptor digests and writes each digest from
-    /// byte 31 down to byte 0; reproduced here from this image's own signing key. Populated only for a signed image.
+    /// block of the plaintext signed image, stored from last byte to first. Each per-block
+    /// HMAC-SHA256 descriptor digest, from this image's own signing key, is stored with its bytes
+    /// reversed (byte 31 first). Populated only for a signed image.
     /// </summary>
     public bool CaptureImageDigests;
 
@@ -123,7 +123,7 @@ public class ProsperoPfsBuilder
 
         // The PFS super-root holds the flat path table (+ optional collision resolver) and the user
         // root ("uroot"). These internal pseudo files are not part of the user tree, so synthesize
-        // them from their dedicated inodes to mirror the reference super-root layout.
+        // them from their dedicated inodes to mirror the PFS super-root layout.
         root.Children.Add(ImageNodeFromInode(fpt_ino, "inode_flat_path_table", isDir: false, isInternal: true));
         if (cr_ino != null)
             root.Children.Add(ImageNodeFromInode(cr_ino, "collision_resolver", isDir: false, isInternal: true));
@@ -360,8 +360,8 @@ public class ProsperoPfsBuilder
                       view.WriteArray(sectorOffset, sectorBuffer, 0, xtsSectorSize);
                       return localData;
                   },
-                  // Finalizer
-                  local => { });
+                  // Finalizer: dispose the thread-local transform.
+                  local => local.Item1.Dispose());
             }
         }
     }
@@ -420,7 +420,7 @@ public class ProsperoPfsBuilder
         {
             Log("Encrypting...");
             var (tweakKey, dataKey) = Crypto.PfsGenEncKey(properties.EKPFS, hdr.Seed);
-            var transformer = new XtsBlockTransform(dataKey, tweakKey);
+            using var transformer = new XtsBlockTransform(dataKey, tweakKey);
             byte[] sectorBuffer = new byte[xtsSectorSize];
             foreach (var xtsSector in XtsSectorGen())
             {
@@ -506,10 +506,17 @@ public class ProsperoPfsBuilder
     }
 
     ///<summary>
-    ///Given an inode number and an index into the db[] array, returns the absolute offset of that array value
+    ///Given an inode number and an index into the db[] array, returns the absolute offset of that array value.
+    ///Inodes are packed per block with padding at the tail of each block, so the block boundary is applied
+    ///rather than treating the table as one contiguous run.
     ///</summary>
     long inoNumberToOffset(uint number, int db = 0)
-      => hdr.BlockSize + (ProsperoDinodeS32.SizeOf * number) + 0x64 + (36 * db);
+    {
+        long inodesPerBlock = hdr.BlockSize / ProsperoDinodeS32.SizeOf;
+        long block = 1 + number / inodesPerBlock;
+        long withinBlock = (number % inodesPerBlock) * ProsperoDinodeS32.SizeOf;
+        return (block * hdr.BlockSize) + withinBlock + 0x64 + (36 * db);
+    }
 
     /// <summary>
     /// Sets the data blocks. Also updates header for total number of data blocks.

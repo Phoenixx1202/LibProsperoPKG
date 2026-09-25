@@ -17,7 +17,7 @@
 // is usable.
 //
 // What is not done here: a fully accepted retail image additionally depends on
-// reference-only secrets that cannot be reproduced here. This class supplies the signing/key
+// console-held secrets that cannot be reproduced here. This class supplies the signing/key
 // primitives the write path consumes, and is fully self-validated in isolation.
 
 using LibProsperoPkg.Keys;
@@ -30,7 +30,7 @@ namespace LibProsperoPkg.PKG;
 /// <summary>
 /// PS5 PKG-metadata signing and PFS key-derivation primitives backed by the embedded
 /// PS5 key material. See the file header for the boundary between what is
-/// verifiable here and what additionally depends on reference-only secrets.
+/// verifiable here and what additionally depends on console-held secrets.
 /// </summary>
 public static class ProsperoPkgSigner
 {
@@ -97,6 +97,33 @@ public static class ProsperoPkgSigner
     }
 
     /// <summary>
+    /// Produces the 384-byte CNT header-signature value: the 32-byte SHA3-256 header digest is
+    /// PKCS#1 v1.5 (type 2) padded and raised to the public exponent of the PKG-metadata RSA-3072
+    /// key. A verifier recovers the padded block with the private exponent, strips the padding and
+    /// compares the trailing 32 bytes to its own SHA3-256 of the header region.
+    /// </summary>
+    /// <param name="sha3Digest">The 32-byte SHA3-256 digest of the CNT header region.</param>
+    /// <returns>A 384-byte big-endian value.</returns>
+    /// <exception cref="InvalidOperationException">The PKG-metadata key is unavailable.</exception>
+    public static byte[] EncryptHeaderDigest(byte[] sha3Digest)
+    {
+        ArgumentNullException.ThrowIfNull(sha3Digest);
+        if (sha3Digest.Length != 32)
+            throw new ArgumentException("A SHA3-256 digest is exactly 32 bytes.", nameof(sha3Digest));
+
+        using var rsa = ProsperoKeys.CreateMetadataRsa();
+        return rsa.Encrypt(sha3Digest, RSAEncryptionPadding.Pkcs1);
+    }
+
+    /// <summary>Recovers the 32-byte digest sealed by <see cref="EncryptHeaderDigest"/>.</summary>
+    public static byte[] DecryptHeaderDigest(byte[] signature)
+    {
+        ArgumentNullException.ThrowIfNull(signature);
+        using var rsa = ProsperoKeys.CreateMetadataRsa();
+        return rsa.Decrypt(signature, RSAEncryptionPadding.Pkcs1);
+    }
+
+    /// <summary>
     /// Returns the big-endian modulus (n) of the embedded PKG-metadata RSA-3072 key (384 bytes).
     /// </summary>
     public static byte[] MetadataModulus()
@@ -143,75 +170,17 @@ public static class ProsperoPkgSigner
         ComputeKeys(contentId, passcode, 1);
 
     /// <summary>
-    /// Computes a package key for the given index. The key is
-    /// <c>SHA256( SHA256(index_be) || SHA256(content_id padded to 48) || passcode )</c>.
-    /// Index 1 is the EKPFS.
+    /// Computes a package key for the given index using the PS5 key ladder:
+    /// <c>SHA3-256( SHA3-256(index_be) || SHA3-256(content_id padded to 48) || passcode )</c>.
+    /// Index 1 is the EKPFS. Delegates to the canonical
+    /// <see cref="Util.Crypto.ComputeKeys(string, string, uint, bool)"/> (SHA3-256) so the derivation
+    /// matches the outer-PFS mount-key path.
     /// </summary>
     public static byte[] ComputeKeys(string contentId, string passcode, uint index)
     {
         ArgumentNullException.ThrowIfNull(contentId);
         ArgumentNullException.ThrowIfNull(passcode);
-        if (contentId.Length != 36)
-            throw new ArgumentException($"Content id must be exactly 36 characters (was {contentId.Length}).", nameof(contentId));
-        if (passcode.Length != 32)
-            throw new ArgumentException($"Passcode must be exactly 32 characters (was {passcode.Length}).", nameof(passcode));
-
-        Span<byte> indexBe = stackalloc byte[4];
-        System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(indexBe, index);
-
-        byte[] data = new byte[96];
-        SHA256.HashData(indexBe).CopyTo(data.AsSpan(0));
-        SHA256.HashData(Encoding.ASCII.GetBytes(contentId.PadRight(48, '\0'))).CopyTo(data.AsSpan(32));
-        Encoding.ASCII.GetBytes(passcode).CopyTo(data.AsSpan(64));
-
-        return SHA256.HashData(data);
+        return Util.Crypto.ComputeKeys(contentId, passcode, index, useSha3: true);
     }
 
-    /// <summary>
-    /// Derives the (tweak, data) AES-XTS key pair used to encrypt a PFS image from the EKPFS
-    /// and the PFS header seed, following the published key derivation.
-    /// </summary>
-    /// <param name="ekpfs">The 32-byte EKPFS from <see cref="ComputeEkpfs"/>.</param>
-    /// <param name="seed">The 16-byte PFS header crypto seed.</param>
-    /// <param name="newCrypt">
-    /// When true, derive the encryption key from <c>HMAC(EKPFS, seed)</c> first — the
-    /// <c>new_crypt</c> path (the <c>newCrypt</c> scheme). Defaults to the classic path.
-    /// </param>
-    /// <returns>A tuple of (tweakKey, dataKey), each 16 bytes.</returns>
-    public static (byte[] TweakKey, byte[] DataKey) DerivePfsEncryptionKeys(byte[] ekpfs, byte[] seed, bool newCrypt = false)
-    {
-        ArgumentNullException.ThrowIfNull(ekpfs);
-        ArgumentNullException.ThrowIfNull(seed);
-
-        // new_crypt: run the EKPFS through HMAC(EKPFS, seed) before the standard derivation.
-        byte[] baseKey = newCrypt ? HMACSHA256.HashData(ekpfs, seed) : ekpfs;
-        byte[] enc = PfsGenCryptoKey(baseKey, seed, 1);
-        // HMAC-SHA256 always yields 32 bytes; guard the invariant before slicing.
-        if (enc.Length < 32)
-            throw new InvalidOperationException("PFS key derivation returned an undersized key.");
-        byte[] tweak = enc[..16];
-        byte[] dataKey = enc[16..32];
-        return (tweak, dataKey);
-    }
-
-    /// <summary>
-    /// Derives the PFS signing key (index 2) from the EKPFS and PFS header seed, following the
-    /// published <c>PfsGenSignKey</c> derivation.
-    /// </summary>
-    public static byte[] DerivePfsSignKey(byte[] ekpfs, byte[] seed) => PfsGenCryptoKey(ekpfs, seed, 2);
-
-    /// <summary>
-    /// The common PFS key generator: <c>HMAC-SHA256(ekpfs, index_le || seed)</c>.
-    /// </summary>
-    private static byte[] PfsGenCryptoKey(byte[] ekpfs, byte[] seed, uint index)
-    {
-        ArgumentNullException.ThrowIfNull(ekpfs);
-        ArgumentNullException.ThrowIfNull(seed);
-
-        byte[] message = new byte[4 + seed.Length];
-        // The index is appended little-endian.
-        System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(message.AsSpan(0, 4), index);
-        seed.CopyTo(message.AsSpan(4));
-        return HMACSHA256.HashData(ekpfs, message);
-    }
 }

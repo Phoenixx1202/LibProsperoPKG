@@ -102,6 +102,7 @@ public static class ProsperoPkgReader
         return new ProsperoFihHeader
         {
             SignedByte = buffer[ProsperoPkgLayout.FihSignedByteOffset],
+            FormatVersion = BinaryPrimitives.ReadUInt16LittleEndian(span[ProsperoPkgLayout.FihFormatVersionField..]),
             PfsImageOffset = BinaryPrimitives.ReadUInt64LittleEndian(span[ProsperoPkgLayout.FihPfsImageOffsetField..]),
             PfsImageSize = BinaryPrimitives.ReadUInt64LittleEndian(span[ProsperoPkgLayout.FihPfsImageSizeField..]),
             EmbeddedCntOffset = BinaryPrimitives.ReadUInt64LittleEndian(span[ProsperoPkgLayout.FihEmbeddedCntOffsetField..]),
@@ -127,6 +128,7 @@ public static class ProsperoPkgReader
             ContentId = ReadNulTrimmedAscii(span.Slice(0x40, ProsperoPkgLayout.ContentIdSize)),
             DrmType = BinaryPrimitives.ReadUInt32BigEndian(span[0x70..]),
             ContentType = BinaryPrimitives.ReadUInt32BigEndian(span[0x74..]),
+            ContentFlags = BinaryPrimitives.ReadUInt32BigEndian(span[0x78..]),
         };
     }
 
@@ -200,7 +202,7 @@ public static class ProsperoPkgReader
         {
             int read = stream.Read(buffer, offset + total, count - total);
             if (read == 0)
-                throw new EndOfStreamException("Unexpected end of PS5 PKG while reading container.");
+                throw new InvalidDataException("Unexpected end of PS5 PKG while reading container (file is truncated).");
             total += read;
         }
     }

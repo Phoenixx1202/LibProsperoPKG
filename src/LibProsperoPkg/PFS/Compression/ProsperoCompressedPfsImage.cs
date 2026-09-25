@@ -1,17 +1,13 @@
 // LibProsperoPkg - A library for building and inspecting PS5 packages.
 // Copyright (C) 2026 SvenGDK
 //
-// PS5 PFSv3 inner-image packer/unpacker — the Kraken "PFSC" container used for
-// inner images (pfs_image.dat). This is the Kraken counterpart of the zlib packer
-// in LibProsperoPkg.PFS.ProsperoPfsc: same 'PFSC' magic, but format version 3, a
-// 7-section directory, SHA3-256 digests and Kraken (level 7, window 18) per-block compression
-// — NOT zlib. The two are kept as separate code paths because the installable debug .pkg inner
-// image uses the zlib PFSC, while the "nwonly" inner image uses this Kraken PFSv3
-// container (see ProsperoPkgBuildProperties.InnerCompression).
+// PFSv3 "PFSC" container packer/unpacker: same 'PFSC' magic as the format-version-2 container in
+// LibProsperoPkg.PFS.ProsperoPfsc, but format version 3, a 7-section directory, SHA3-256 digests
+// and Kraken (level 7, window 18) per-block compression.
 //
 // Compression and decompression use the codec in PFS/Compression: CompressedPfsFileWriter
-// (Kraken encoder) and CompressedPfsFile (Kraken decoder). Every byte the writer emits
-// round-trips byte-exact through the in-process decoder for the supported container shapes.
+// (encoder) and CompressedPfsFile (decoder). Writer output round-trips exactly through the
+// in-process decoder for the supported container shapes.
 #nullable enable
 using System;
 using System.Buffers.Binary;
@@ -63,6 +59,60 @@ public static class ProsperoCompressedPfsImage
     private const uint PfscMagic = 0x43534650; // 'P','F','S','C'
 
     /// <summary>
+    /// Streams a prepared inner image into a PS5 Kraken PFSv3 container. The output is byte for byte
+    /// what <see cref="Pack(ReadOnlySpan{byte}, int, int)"/> produces, and neither the image nor the
+    /// container is held in memory.
+    /// </summary>
+    /// <param name="destination">Seekable, writable. The container is written at its current position.</param>
+    /// <param name="source">Readable; read once, front to back.</param>
+    /// <param name="sourceLength">The logical length to read from <paramref name="source"/>.</param>
+    /// <param name="level">The Kraken level recorded in the header. Default 7.</param>
+    /// <param name="blockSize">The logical block size. Default 256 KiB. Must be positive.</param>
+    public static void PackTo(Stream destination, Stream source, long sourceLength,
+        int level = DefaultLevel, int blockSize = DefaultBlockSize)
+        => ProsperoCompressedPfsFileWriter.WriteCompressed(destination, source, sourceLength, level, blockSize);
+
+    /// <summary>
+    /// Reads a container's block tables and counts how many blocks were kept compressed, without
+    /// reading the block payloads.
+    /// </summary>
+    private static (int BlockSize, int BlockCount, int CompressedBlocks) ReadBlockStatistics(string containerPath)
+    {
+        using var stream = new FileStream(containerPath, FileMode.Open, FileAccess.Read, FileShare.Read);
+        Span<byte> header = stackalloc byte[0x48 + 7 * 16];
+        stream.ReadExactly(header);
+        int blockSize = checked((int)BinaryPrimitives.ReadUInt32LittleEndian(header[0x08..]));
+        int sectionCount = BinaryPrimitives.ReadUInt16LittleEndian(header[0x06..]);
+        long boundaryOffset = 0, boundarySize = 0;
+        for (int i = 0; i < sectionCount; i++)
+        {
+            int p = 0x48 + i * 16;
+            if (BinaryPrimitives.ReadUInt16LittleEndian(header[p..]) != 3) continue;
+            boundaryOffset = BinaryPrimitives.ReadUInt32LittleEndian(header[(p + 2)..])
+                             | ((long)BinaryPrimitives.ReadUInt16LittleEndian(header[(p + 6)..]) << 32);
+            boundarySize = BinaryPrimitives.ReadUInt32LittleEndian(header[(p + 10)..])
+                           | ((long)BinaryPrimitives.ReadUInt16LittleEndian(header[(p + 14)..]) << 32);
+        }
+        if (boundarySize < 2 * 16) return (blockSize, 0, 0);
+        int blockCount = checked((int)(boundarySize / 16)) - 1;
+        var table = new byte[checked((int)boundarySize)];
+        stream.Seek(boundaryOffset, SeekOrigin.Begin);
+        stream.ReadExactly(table);
+        int compressed = 0;
+        for (int i = 0; i < blockCount; i++)
+        {
+            ulong e0 = BinaryPrimitives.ReadUInt64LittleEndian(table.AsSpan(i * 16));
+            ulong e1 = BinaryPrimitives.ReadUInt64LittleEndian(table.AsSpan(i * 16 + 8));
+            ulong e0n = BinaryPrimitives.ReadUInt64LittleEndian(table.AsSpan((i + 1) * 16));
+            ulong e1n = BinaryPrimitives.ReadUInt64LittleEndian(table.AsSpan((i + 1) * 16 + 8));
+            long comp = (long)((e0n & 0xFFFFFFFFFFFuL) - (e0 & 0xFFFFFFFFFFFuL));
+            long uncomp = (long)((e1n & 0xFFFFFFFFFFFuL) - (e1 & 0xFFFFFFFFFFFuL));
+            if (comp != uncomp) compressed++;
+        }
+        return (blockSize, blockCount, compressed);
+    }
+
+    /// <summary>
     /// Compresses an already-prepared inner image into a PS5 Kraken PFSv3 container in memory. Each
     /// block is Kraken-compressed; blocks that do not shrink are stored uncompressed.
     /// </summary>
@@ -109,40 +159,36 @@ public static class ProsperoCompressedPfsImage
 
         var log = logger ?? (_ => { });
         long length = new FileInfo(inputImagePath).Length;
-        if (length > Array.MaxLength)
-            throw new NotSupportedException(
-                $"The inner image is {length:N0} bytes; the in-memory Kraken packer supports up to {Array.MaxLength:N0} bytes.");
 
         var dir = Path.GetDirectoryName(Path.GetFullPath(outputPath));
         if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
 
         log($"Packing {Path.GetFileName(inputImagePath)} ({length:N0} bytes) into a PS5 Kraken PFSv3 image...");
 
-        byte[] raw = File.ReadAllBytes(inputImagePath);
-        byte[] container = Pack(raw, level, blockSize);
-        File.WriteAllBytes(outputPath, container);
+        // Streamed, so an image of any size the format allows can be packed without holding either the
+        // image or the container in memory.
+        using (var source = new FileStream(inputImagePath, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 20))
+        using (var destination = new FileStream(outputPath, FileMode.Create, FileAccess.Write, FileShare.None, 1 << 20))
+        {
+            ProsperoCompressedPfsFileWriter.WriteCompressed(destination, source, length, level, blockSize);
+        }
 
-        // Parse the produced container to report accurate block statistics.
-        var parsed = ProsperoCompressedPfsFile.Parse(container);
-        int compressed = 0;
-        foreach (var block in parsed.Blocks)
-            if (!block.IsStored) compressed++;
-        int blockCount = parsed.Blocks.Count;
+        var stats = ReadBlockStatistics(outputPath);
 
         var result = new ProsperoCompressedPfsImageResult
         {
             OutputPath = outputPath,
             RawSize = length,
-            EncodedSize = container.Length,
-            BlockSize = parsed.BlockSize,
-            BlockCount = blockCount,
-            CompressedBlocks = compressed,
+            EncodedSize = new FileInfo(outputPath).Length,
+            BlockSize = stats.BlockSize,
+            BlockCount = stats.BlockCount,
+            CompressedBlocks = stats.CompressedBlocks,
         };
 
         if (result.StoredRaw)
             log("Compression produced no benefit; every block was stored uncompressed.");
         else
-            log($"Done: {result.EncodedSize:N0} bytes ({result.GainPercent:F1}% saved, {compressed}/{blockCount} blocks compressed).");
+            log($"Done: {result.EncodedSize:N0} bytes ({result.GainPercent:F1}% saved, {result.CompressedBlocks}/{result.BlockCount} blocks compressed).");
 
         return result;
     }
@@ -175,7 +221,7 @@ public static class ProsperoCompressedPfsImage
 
         var log = logger ?? (_ => { });
         byte[] container = File.ReadAllBytes(inputPath);
-        if (!IsScePfsImage(container))
+        if (!IsPfsImage(container))
             throw new InvalidDataException("The input file is not a PFSv3 compressed image (wrong magic/version).");
 
         byte[] raw = Unpack(container);
@@ -193,7 +239,7 @@ public static class ProsperoCompressedPfsImage
     /// header. This distinguishes the Kraken container from the zlib PFSC (which carries a
     /// zero word at offset 0x04 and no section count), so callers can pick the right unpacker.
     /// </summary>
-    public static bool IsScePfsImage(ReadOnlySpan<byte> data)
+    public static bool IsPfsImage(ReadOnlySpan<byte> data)
     {
         if (data.Length < 0x08) return false;
         if (BinaryPrimitives.ReadUInt32LittleEndian(data) != PfscMagic) return false;
@@ -204,19 +250,19 @@ public static class ProsperoCompressedPfsImage
     }
 
     /// <summary>Returns <c>true</c> when the file at <paramref name="path"/> is a PS5 PFSv3 compressed image.</summary>
-    public static bool IsScePfsImageFile(string path)
+    public static bool IsPfsImageFile(string path)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(path);
         using var s = File.OpenRead(path);
         Span<byte> head = stackalloc byte[8];
         int read = s.Read(head);
-        return read == head.Length && IsScePfsImage(head);
+        return read == head.Length && IsPfsImage(head);
     }
 
     /// <summary>
     /// In-process self-test: packs <paramref name="image"/> with the Kraken encoder, decodes it
-    /// back with the Kraken decoder, and verifies the result is byte-exact. Returns <c>true</c>
-    /// on success. This does not require external processes.
+    /// back with the Kraken decoder, and verifies the result equals the input. Returns <c>true</c>
+    /// on success.
     /// </summary>
     /// <param name="image">The image to round-trip.</param>
     /// <param name="level">The Kraken level recorded in the header. Default 7.</param>
@@ -224,7 +270,7 @@ public static class ProsperoCompressedPfsImage
     public static bool ValidateRoundTrip(ReadOnlySpan<byte> image, int level = DefaultLevel, int blockSize = DefaultBlockSize)
     {
         byte[] container = Pack(image, level, blockSize);
-        if (!IsScePfsImage(container)) return false;
+        if (!IsPfsImage(container)) return false;
         byte[] restored = ProsperoCompressedPfsFile.Parse(container).Decompress();
         return restored.AsSpan().SequenceEqual(image);
     }

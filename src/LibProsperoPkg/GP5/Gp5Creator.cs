@@ -15,8 +15,8 @@ namespace LibProsperoPkg.GP5;
 public static class Gp5Creator
 {
     /// <summary>
-    /// The default directory-exclude mask, so project scaffolding (the .gp5 itself, keystone,
-    /// intermediate caches, …) never ends up inside the image.
+    /// The default directory-exclude mask: directories (e.g. <c>about</c>) that hold project
+    /// scaffolding rather than image content, so they never end up inside the image.
     /// </summary>
     public const string DefaultDirExclude = "about";
 
@@ -60,7 +60,7 @@ public static class Gp5Creator
     /// Builds a GP5 project in the <see cref="Gp5Layout.Flat"/> style: every file under
     /// <paramref name="sourceFolder"/> is listed as an explicit top-level <c>&lt;file&gt;</c> entry
     /// (inside <c>&lt;files&gt;</c>), with no <c>&lt;rootdir&gt;</c> / <c>&lt;global_exclude&gt;</c>. This
-    /// produces a fully-resolved project that does not rely on the reference tool's own directory walking,
+    /// produces a fully-resolved project that does not rely on directory walking at pack time,
     /// which is convenient for a direct packaging pipeline.
     /// </summary>
     public static Gp5Project FromFolderExplicit(

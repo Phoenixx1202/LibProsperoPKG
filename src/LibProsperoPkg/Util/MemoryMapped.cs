@@ -110,7 +110,7 @@ class ChunkedMemoryReader : IMemoryReader
         {
             int offsetIntoChunk = (int)(pos % chunkSize);
             int toReadFromChunk = Math.Min(chunkSize - offsetIntoChunk, count);
-            reader.Read((long)chunks[chunkIdx++] * chunkSize + offsetIntoChunk, buf, offset, count);
+            reader.Read((long)chunks[chunkIdx++] * chunkSize + offsetIntoChunk, buf, offset, toReadFromChunk);
             pos += toReadFromChunk;
             offset += toReadFromChunk;
             count -= toReadFromChunk;
@@ -138,7 +138,7 @@ class BufferedMemoryReader : IMemoryReader
 
     public void Read(long pos, byte[] buf, int offset, int count)
     {
-        while (count > 0 && pos > 0)
+        while (count > 0)
         {
             if (bufferStart > pos || pos >= bufferStart + buffer.Length)
             {

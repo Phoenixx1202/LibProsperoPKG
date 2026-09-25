@@ -8,14 +8,13 @@
 // and pic*.dds are 3840x2160 (8294548 bytes), exactly 148 header bytes + width*height BC7 payload
 // bytes.
 //
-// This file produces byte-exact DDS headers and a spec-conformant BC7 payload using mode 6
+// This file produces deterministic DDS headers and a spec-conformant BC7 payload using mode 6
 // (single subset, RGBA, 7-bit endpoints + per-endpoint p-bit, 16 four-bit indices). Mode 6 is the
 // simplest BC7 block that still covers the full RGBA range, so the output is a valid BC7 texture
 // the console GPU can sample.
 
 #nullable enable
 
-using ImageMagick;
 using System;
 using System.IO;
 
@@ -24,7 +23,7 @@ namespace LibProsperoPkg.PKG;
 /// <summary>
 /// PNG-to-DDS (BC7) re-encoder for the PS5 <c>sce_sys</c> icon/pic media. Produces a
 /// DX10 <c>DXGI_FORMAT_BC7_UNORM</c> DDS with no mipmaps, matching the surface dimensions and
-/// header layout of the reference <c>icon0.dds</c> / <c>pic0.dds</c> / <c>pic1.dds</c> / <c>pic2.dds</c>.
+/// header layout of the standard <c>icon0.dds</c> / <c>pic0.dds</c> / <c>pic1.dds</c> / <c>pic2.dds</c>.
 /// </summary>
 public static class ProsperoDdsEncoder
 {
@@ -47,23 +46,17 @@ public static class ProsperoDdsEncoder
         if (pngBytes is null || pngBytes.Length == 0)
             throw new ArgumentException("Empty image.", nameof(pngBytes));
 
-        using var image = new MagickImage(pngBytes);
-        int width = (int)image.Width;
-        int height = (int)image.Height;
-        if (width <= 0 || height <= 0)
+        ProsperoPngDecoder.Image image = ProsperoPngDecoder.Decode(pngBytes);
+        if (image.Width <= 0 || image.Height <= 0)
             throw new InvalidDataException("Image has no pixels.");
 
-        using IPixelCollection<byte> pixels = image.GetPixels();
-        byte[] rgba = pixels.ToByteArray(PixelMapping.RGBA)
-            ?? throw new InvalidDataException("Unable to read RGBA pixels.");
-
-        return EncodeRgbaToDds(rgba, width, height);
+        return EncodeRgbaToDds(image.Rgba, image.Width, image.Height);
     }
 
     /// <summary>
     /// Encodes a tightly-packed top-down RGBA8 buffer (<paramref name="width"/>x<paramref name="height"/>,
-    /// 4 bytes/pixel) into a BC7 DX10 DDS file. Dimensions are rounded up to a multiple of four for
-    /// block alignment (edge pixels are repeated), matching how DDS surfaces store partial blocks.
+    /// 4 bytes/pixel) into a BC7 DX10 DDS file. The header carries the true image dimensions; the block
+    /// surface is rounded up to a multiple of four (edge pixels are repeated) for the partial-block payload.
     /// </summary>
     public static byte[] EncodeRgbaToDds(byte[] rgba, int width, int height)
     {
@@ -79,7 +72,8 @@ public static class ProsperoDdsEncoder
         long payloadSize = (long)surfaceWidth * surfaceHeight; // BC7 is 16 bytes per 4x4 block = 1 byte/texel.
 
         byte[] dds = new byte[HeaderSize + payloadSize];
-        WriteHeader(dds, surfaceWidth, surfaceHeight, (uint)payloadSize);
+        // dwWidth/dwHeight are the true image dimensions; block padding is implicit in the BC7 format.
+        WriteHeader(dds, width, height, (uint)payloadSize);
 
         int offset = HeaderSize;
         var block = new byte[16 * 4];

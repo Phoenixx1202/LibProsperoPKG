@@ -21,7 +21,7 @@ public enum ProsperoPkgType
 
     /// <summary>
     /// Finalized retail image (<c>\x7FFIH</c>, signed byte 0x80): a full package as submitted with the
-    /// reference tools. The signed byte at offset 0x05 is what distinguishes it from a debug image.
+    /// finalized toolchain. The signed byte at offset 0x05 is what distinguishes it from a debug image.
     /// </summary>
     FullRetail,
 
@@ -61,6 +61,12 @@ public static class ProsperoPkgLayout
     /// <summary>FIH header offset of the signed byte (0x80 = official, 0x00 = debug).</summary>
     public const int FihSignedByteOffset = 0x05;
 
+    /// <summary>FIH header offset of the format version (little-endian u16).</summary>
+    public const int FihFormatVersionField = 0x06;
+
+    /// <summary>The finalized-image format version the console mount path requires.</summary>
+    public const ushort FihRequiredFormatVersion = 3;
+
     /// <summary>FIH header offset of the shared encrypted PFS image offset (little-endian u64).</summary>
     public const int FihPfsImageOffsetField = 0x10;
 
@@ -70,8 +76,16 @@ public static class ProsperoPkgLayout
     /// <summary>FIH header offset of the embedded CNT container offset (little-endian u64).</summary>
     public const int FihEmbeddedCntOffsetField = 0x58;
 
-    // ---- Outer-PFS accounting fields (little-endian; validated from the FIH writer output
-    // and cross-checked against three reference debug packages). These describe
+    /// <summary>
+    /// FIH header offset of the inner mount's data-region block count (little-endian u64) — the metaBase
+    /// block index = MetaBaseLogical / <see cref="FihHeaderRegionSize"/>. The installer's transfer reads
+    /// this to size the inner mount's data region during pre-allocation; a zero value is rejected. This
+    /// value must be nonzero for package types 0x14001 and 0x14004.
+    /// </summary>
+    public const int FihDataRegionBlockCountField = 0x50;
+
+    // ---- Outer-PFS accounting fields (little-endian; derived from the FIH writer output
+    // and cross-checked across debug packages). These describe
     // the inner pfs_image.dat / metadata block split of the shared outer-PFS image, not the
     // embedded CNT. Invariant: FihInnerImageBlockCountField + FihMetaBlockCountField ==
     // pfsImageSize / FihHeaderRegionSize. ----
@@ -90,6 +104,33 @@ public static class ProsperoPkgLayout
     /// (little-endian u64) - equals <see cref="FihInnerImageBlockCountField"/> * <see cref="FihHeaderRegionSize"/>.
     /// </summary>
     public const int FihInnerImageSizeField = 0xA0;
+
+    /// <summary>
+    /// FIH header offset of the uncompressed inner-image logical size in bytes (little-endian u64).
+    /// This is the plaintext size of the inner PFS image whose content digest is stored at 0xB0, and
+    /// the size the mount pre-allocation reads; it must equal the 0xB0 digest preimage length.
+    /// </summary>
+    public const int FihInnerImageLogicalSizeField = 0xA8;
+
+    /// <summary>FIH header offset of the content-version echo (little-endian u32) — high 32 bits of the
+    /// content version u64 (major BCD in the top byte).</summary>
+    public const int FihContentVersionField = 0x9C;
+
+    /// <summary>FIH header offset of the outer-PFS regular file count (little-endian u32).</summary>
+    public const int FihOuterFileCountField = 0xF0;
+
+    /// <summary>FIH header offset of the outer-PFS flat-path-table block accounting value (little-endian u32).</summary>
+    public const int FihFlatPathTableBlockCountField = 0xF8;
+
+    /// <summary>
+    /// Outer-PFS regular file count for the fixed data-first template. For the nwonly outer template
+    /// (single pfs_image.dat data file; naps_pkg_layout.dat is a system file, not counted) this is 1.
+    /// </summary>
+    public const uint FihOuterFileCount = 1;
+
+    /// <summary>Outer-PFS flat-path-table block accounting value for the fixed data-first template.
+    /// For the nwonly outer template this is 2.</summary>
+    public const uint FihFlatPathTableBlockCount = 2;
 }
 
 /// <summary>
@@ -106,16 +147,18 @@ public enum ProsperoEntryId : uint
     EntryNames = 0x0200,
     LicenseDat = 0x0400,
     LicenseInfo = 0x0401,
-    ParamJson = 0x1000,
-    ParamSfo = 0x1001,
-    PlaygoChunkDat = 0x1300,
-    PlaygoChunkSha = 0x1301,
-    PlaygoManifestXml = 0x1302,
+    Imagedigs = 0x040A,
+    ParamSfo = 0x1000,
+    PlaygoChunkDat = 0x1001,
+    PlaygoChunkSha = 0x1002,
+    PlaygoManifestXml = 0x1003,
     Icon0Png = 0x1200,
     Pic0Png = 0x1220,
     Snd0At9 = 0x1240,
     Icon0Dds = 0x1280,
     Pic0Dds = 0x12A0,
     Pic1Dds = 0x12C0,
-    Pic2Dds = 0x2060,
+    ParamJson = 0x2000,
+    PlaygoHashTable = 0x2010,
+    PlaygoFicm = 0x2011,
 }

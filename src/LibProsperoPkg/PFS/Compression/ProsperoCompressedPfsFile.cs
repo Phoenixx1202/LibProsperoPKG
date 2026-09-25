@@ -5,11 +5,11 @@
 // container.
 //
 // IMPORTANT: this is a DIFFERENT format from the zlib "PFSC" image handled by
-// LibProsperoPkg.PFS.PfscEncoder/PFSCReader. The two collide on the 4-byte 'PFSC' magic but
+// LibProsperoPkg.PFS.ProsperoPfscEncoder/ProsperoPfscReader. The two collide on the 4-byte 'PFSC' magic but
 // differ in everything else; they are disambiguated by the format-version field at offset 0x04
 // (version 2 or 3; the zlib variant stores 0 there).
 //
-// Every field decoded here was validated byte-for-byte against reference output, including: the SHA3-256 file digest at 0x28, the 7-entry section directory at
+// Every field decoded here is modeled, including: the SHA3-256 file digest at 0x28, the 7-entry section directory at
 // 0x48, the block boundary table (id=3) and the per-block SHA3-256 hash table (id=4).
 #nullable enable
 using LibProsperoPkg.PFS.Compression.Oodle;
@@ -73,10 +73,23 @@ public readonly struct PfsBlock
     public bool IsBareEntropy { get; init; }
 
     /// <summary>
-    /// For a two-chunk compressed block, the compressed size in bytes of the first chunk (recovered
-    /// from the boundary size hint); zero otherwise. The second chunk occupies the remaining bytes.
+    /// The compressed size in bytes of the block's first sub-chunk, recovered from the boundary size
+    /// hint. The second sub-chunk, when present, occupies the remaining bytes. The hint carries this
+    /// value for every block, including single-sub-chunk and stored blocks.
     /// </summary>
     public int FirstChunkCompressedSize { get; init; }
+
+    /// <summary>
+    /// The uncompressed size in bytes of the block's first sub-chunk: the whole block for a block of
+    /// at most 128 KiB, otherwise exactly 128 KiB.
+    /// </summary>
+    public int Chunk0UncompressedSize { get; init; }
+
+    /// <summary>
+    /// The uncompressed size in bytes of the block's second sub-chunk, or zero when the block has one
+    /// sub-chunk.
+    /// </summary>
+    public int Chunk1UncompressedSize { get; init; }
 
     /// <summary>
     /// The newLZ literal model for this compressed block, recovered from the boundary flag's low bit
@@ -100,7 +113,7 @@ public readonly struct PfsBlock
     /// </summary>
     /// <remarks>
     /// The per-block storage location of a non-<see cref="ProsperoPfsShufflePattern.None"/> pattern has not
-    /// been validated against reference output, so this reader
+    /// been characterized, so this reader
     /// reports <see cref="ProsperoPfsShufflePattern.None"/>. Do not rely on it to detect shuffled blocks.
     /// </remarks>
     public ProsperoPfsShufflePattern ShufflePattern => ProsperoPfsShufflePattern.None;
@@ -109,9 +122,9 @@ public readonly struct PfsBlock
 /// <summary>
 /// A parsed PS5 PFSv2/PFSv3 compression container ("PFSC"). Provides the header fields,
 /// the file-level SHA3-256 digest, the per-block table and full decompression of containers
-/// produced by <see cref="ProsperoCompressedPfsFileWriter"/> as well as reference containers: stored
+/// produced by <see cref="ProsperoCompressedPfsFileWriter"/> as well as finalized containers: stored
 /// blocks plus this library's Kraken codec, which decodes the entropy-coded
-/// (Huffman) arrays and the post-seed excess framing used by reference blocks.
+/// (Huffman) arrays and the post-seed excess framing used by finalized blocks.
 /// </summary>
 public sealed class ProsperoCompressedPfsFile
 {
@@ -209,7 +222,7 @@ public sealed class ProsperoCompressedPfsFile
     /// Decompresses the whole container back to its original payload. Stored blocks are copied
     /// verbatim; compressed blocks are decoded with the Kraken codec
     /// (<see cref="Oodle.KrakenDecoder"/>), which reads both this library's own output and
-    /// reference blocks (entropy-coded arrays + the post-seed excess framing). The result has
+    /// finalized blocks (entropy-coded arrays + the post-seed excess framing). The result has
     /// length <see cref="UncompressedSize"/>.
     /// </summary>
     /// <returns>The reconstructed uncompressed payload.</returns>
@@ -218,6 +231,10 @@ public sealed class ProsperoCompressedPfsFile
     /// </exception>
     public byte[] Decompress()
     {
+        if (UncompressedSize > Array.MaxLength)
+            throw new NotSupportedException(
+                $"The container expands to {UncompressedSize:N0} bytes, which no single array can hold. " +
+                "Decompress it block by block instead.");
         var output = new byte[UncompressedSize];
         foreach (PfsBlock block in Blocks)
         {
@@ -242,7 +259,7 @@ public sealed class ProsperoCompressedPfsFile
     /// container, distinguishing it from the zlib "PFSC" image (which stores 0 in the
     /// version field).
     /// </summary>
-    public static bool IsScePfsCompressed(ReadOnlySpan<byte> data)
+    public static bool IsPfsCompressed(ReadOnlySpan<byte> data)
     {
         if (data.Length < MinHeaderSize)
             return false;
@@ -335,8 +352,12 @@ public sealed class ProsperoCompressedPfsFile
             ushort id = BinaryPrimitives.ReadUInt16LittleEndian(span[pos..]);
             if (id == 0)
                 break;
-            long offset = BinaryPrimitives.ReadUInt32LittleEndian(span[(pos + 2)..]);
-            long size = BinaryPrimitives.ReadUInt32LittleEndian(span[(pos + 10)..]);
+            // Both fields are 48 bits: a low 32-bit word and a 16-bit high word, so a container may
+            // exceed 4 GiB.
+            long offset = BinaryPrimitives.ReadUInt32LittleEndian(span[(pos + 2)..])
+                          | ((long)BinaryPrimitives.ReadUInt16LittleEndian(span[(pos + 6)..]) << 32);
+            long size = BinaryPrimitives.ReadUInt32LittleEndian(span[(pos + 10)..])
+                        | ((long)BinaryPrimitives.ReadUInt16LittleEndian(span[(pos + 14)..]) << 32);
             sections[id] = (offset, size);
         }
 
@@ -350,7 +371,9 @@ public sealed class ProsperoCompressedPfsFile
         long dataOffset)
     {
         var blocks = new List<PfsBlock>();
-        if (!sections.TryGetValue(SectionBlockBoundaries, out var bnd) || bnd.Size < 2 * SectionEntrySize)
+        if (!sections.TryGetValue(SectionBlockBoundaries, out var bnd))
+            throw new InvalidDataException("Compression container is missing the block-boundary section.");
+        if (bnd.Size < 2 * SectionEntrySize)
             return blocks;
         if (!InRange(span.Length, bnd.Offset, bnd.Size))
             throw new InvalidDataException("Block boundary table is out of range.");
@@ -373,10 +396,12 @@ public sealed class ProsperoCompressedPfsFile
             ulong compNext = BinaryPrimitives.ReadUInt64LittleEndian(span[(e + SectionEntrySize)..]) & 0xFFFFFFFFFFFUL;
             ulong uncompNext = BinaryPrimitives.ReadUInt64LittleEndian(span[(e + SectionEntrySize + 8)..]) & 0xFFFFFFFFFFFUL;
 
-            int compSize = checked((int)((long)compNext - compRel));
-            int uncompSize = checked((int)((long)uncompNext - uncompRel));
-            if (compSize < 0 || uncompSize < 0)
-                throw new InvalidDataException($"Block {i} has a negative size in the boundary table.");
+            long compSizeL = (long)compNext - compRel;
+            long uncompSizeL = (long)uncompNext - uncompRel;
+            if (compSizeL < 0 || uncompSizeL < 0 || compSizeL > int.MaxValue || uncompSizeL > int.MaxValue)
+                throw new InvalidDataException($"Block {i} has an invalid size in the boundary table.");
+            int compSize = (int)compSizeL;
+            int uncompSize = (int)uncompSizeL;
 
             long absOffset = dataOffset + compRel;
             if (!InRange(span.Length, absOffset, compSize))
@@ -388,8 +413,15 @@ public sealed class ProsperoCompressedPfsFile
             // sub-chunks. This is authoritative; the boundary flag bit varies (newLZ uses 0x20 or 0x40,
             // bare-entropy uses 0x40), so the uncompressed size — not a flag bit — drives the split.
             bool multiChunk = !stored && uncompSize > ChunkMaxUncompressed;
-            bool bareEntropy = !stored && (flags & NewLzFlagBit) == 0;
-            int firstChunkComp = multiChunk ? sizeHint + 1 : 0;
+            // Sub-chunk geometry. The size hint always carries (sub-chunk 0 compressed length - 1),
+            // for single-sub-chunk and stored blocks as well, so the split is recovered uniformly.
+            int firstChunkComp = sizeHint + 1;
+            int chunk0Uncomp = uncompSize < ChunkMaxUncompressed ? uncompSize : ChunkMaxUncompressed;
+            int chunk1Uncomp = uncompSize - chunk0Uncomp;
+            // A sub-chunk whose compressed length equals its uncompressed length is a verbatim copy.
+            // That is decided per sub-chunk, so a block can mix a copied sub-chunk with a coded one.
+            bool chunk0Raw = firstChunkComp == chunk0Uncomp;
+            bool bareEntropy = !chunk0Raw && (flags & NewLzFlagBit) == 0;
             int literalMode = (flags & 1) != 0 ? 0 : 1;
 
             ReadOnlyMemory<byte> hash = ReadOnlyMemory<byte>.Empty;
@@ -410,6 +442,8 @@ public sealed class ProsperoCompressedPfsFile
                 FirstChunkCompressedSize = firstChunkComp,
                 LiteralMode = literalMode,
                 Flags = (int)flags,
+                Chunk0UncompressedSize = chunk0Uncomp,
+                Chunk1UncompressedSize = chunk1Uncomp,
             });
         }
 

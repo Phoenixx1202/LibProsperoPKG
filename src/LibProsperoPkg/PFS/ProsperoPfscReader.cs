@@ -36,8 +36,6 @@ public class ProsperoPfscReader : IMemoryReader
             throw new ArgumentException("Not a PFSC file: missing PFSC magic");
         if (hdr.Unk4 != 0)
             throw new ArgumentException($"Not a PFSC file: unknown data at 0x4 (expected 0, got {hdr.Unk4})");
-        //if (hdr.Unk8 != 6)
-        //  throw new ArgumentException($"Not a PFSC file: unknown data at 0x8 (expected 6, got {hdr.Unk8})");
         if (hdr.BlockSz != (int)hdr.BlockSz2)
             throw new ArgumentException("Not a PFSC file: block size mismatch");
 
@@ -69,7 +67,7 @@ public class ProsperoPfscReader : IMemoryReader
     /// <param name="output">byte array where sector will be written</param>
     public void ReadSector(int idx, byte[] output)
     {
-        if (idx < 0 || idx > sectorMap.Length - 1)
+        if (idx < 0 || idx >= sectorMap.Length - 1)
             throw new ArgumentException("Invalid index", nameof(idx));
 
         var sectorOffset = sectorMap[idx];
@@ -101,6 +99,8 @@ public class ProsperoPfscReader : IMemoryReader
     {
         if (src + count > hdr.DataLength)
             throw new ArgumentException("Attempt to read beyond end of file");
+        if (count <= 0)
+            return; // nothing to read; avoid an out-of-range sector fetch at end-of-image
         var sectorSize = hdr.BlockSz;
         var sectorBuffer = new byte[sectorSize];
         var currentSector = (int)(src / sectorSize);
